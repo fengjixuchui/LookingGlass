@@ -159,22 +159,12 @@ static int renderThread(void * unused)
   {
     if (state.frameTime > 0)
     {
-      tsAdd(&time, state.frameTime);
-
-      // if our clock is too far out of sync, resync it
-      // this can happen when switching to/from a TTY, or due to clock drift
-      // we only check this once every 100 frames
       if (++resyncCheck == 100)
       {
         resyncCheck = 0;
-
-        struct timespec end, diff;
-        clock_gettime(CLOCK_REALTIME, &end);
-        tsDiff(&diff, &time, &end);
-        if (diff.tv_sec > 0 || diff.tv_nsec > 1000000000 || // 100ms
-            diff.tv_sec < 0 || diff.tv_nsec < 0)            // underflow
-          clock_gettime(CLOCK_REALTIME, &time);
+        clock_gettime(CLOCK_REALTIME, &time);
       }
+      tsAdd(&time, state.frameTime);
     }
 
     if (state.lgrResize)
@@ -223,7 +213,15 @@ static int renderThread(void * unused)
         if (atomic_fetch_sub_explicit(&a_framesPending, 1, memory_order_release) > 1)
           continue;
 
-      lgWaitEventAbs(e_frame, &time);
+      if (lgWaitEventAbs(e_frame, &time))
+      {
+        if (state.frameTime > 0)
+        {
+          resyncCheck = 0;
+          clock_gettime(CLOCK_REALTIME, &time);
+          tsAdd(&time, state.frameTime);
+        }
+      }
     }
   }
 
@@ -931,7 +929,6 @@ int eventFilter(void * userdata, SDL_Event * event)
           if (params.useSpiceInput)
           {
             state.serverMode = !state.serverMode;
-            spice_mouse_mode(state.serverMode);
             SDL_SetWindowGrab(state.window, state.serverMode);
             DEBUG_INFO("Server Mode: %s", state.serverMode ? "on" : "off");
 
@@ -1238,6 +1235,7 @@ static int lg_run()
         return -1;
       }
 
+    spice_mouse_mode(true);
     if (!lgCreateThread("spiceThread", spiceThread, NULL, &t_spice))
     {
       DEBUG_ERROR("spice create thread failed");
@@ -1409,7 +1407,6 @@ static int lg_run()
   if (params.captureOnStart)
   {
     state.serverMode = true;
-    spice_mouse_mode(state.serverMode);
     SDL_SetWindowGrab(state.window, state.serverMode);
     DEBUG_INFO("Server Mode: %s", state.serverMode ? "on" : "off");
   }
