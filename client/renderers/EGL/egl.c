@@ -68,6 +68,7 @@ struct Inst
   EGL_Alert       * alert;   // the alert display
 
   LG_RendererFormat    format;
+  bool                 start;
   uint64_t             waitFadeTime;
   bool                 waitDone;
 
@@ -225,6 +226,15 @@ void egl_deinitialize(void * opaque)
   free(this);
 }
 
+void egl_on_restart(void * opaque)
+{
+  struct Inst * this = (struct Inst *)opaque;
+
+  eglDestroyContext(this->display, this->frameContext);
+  this->frameContext = NULL;
+  this->start        = false;
+}
+
 void egl_on_resize(void * opaque, const int width, const int height, const LG_RendererRect destRect)
 {
   struct Inst * this = (struct Inst *)opaque;
@@ -340,6 +350,7 @@ bool egl_on_frame_event(void * opaque, const LG_RendererFormat format, const Fra
     return false;
   }
 
+  this->start = true;
   return true;
 }
 
@@ -532,7 +543,10 @@ bool egl_render(void * opaque, SDL_Window * window)
   glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
   glClear(GL_COLOR_BUFFER_BIT);
 
-  if (egl_desktop_render(this->desktop, this->translateX, this->translateY, this->scaleX, this->scaleY, this->useNearest))
+  if (this->start && egl_desktop_render(this->desktop,
+        this->translateX, this->translateY,
+        this->scaleX    , this->scaleY    ,
+        this->useNearest))
   {
     if (!this->waitFadeTime)
       this->waitFadeTime = microtime() + SPLASH_FADE_TIME;
@@ -558,6 +572,11 @@ bool egl_render(void * opaque, SDL_Window * window)
 
     if (!this->waitDone)
       egl_splash_render(this->splash, a, this->splashRatio);
+  }
+  else
+  {
+    if (!this->start)
+      egl_splash_render(this->splash, 1.0f, this->splashRatio);
   }
 
   if (this->showAlert)
@@ -595,6 +614,7 @@ struct LG_Renderer LGR_EGL =
   .create         = egl_create,
   .initialize     = egl_initialize,
   .deinitialize   = egl_deinitialize,
+  .on_restart     = egl_on_restart,
   .on_resize      = egl_on_resize,
   .on_mouse_shape = egl_on_mouse_shape,
   .on_mouse_event = egl_on_mouse_event,

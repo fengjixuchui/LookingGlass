@@ -57,6 +57,15 @@ HWND MessageHWND;
 typedef NTSTATUS (__stdcall *ZwSetTimerResolution_t)(ULONG RequestedResolution, BOOLEAN Set, PULONG ActualResolution);
 static ZwSetTimerResolution_t ZwSetTimerResolution = NULL;
 
+// linux mingw64 is missing this
+#ifndef MSGFLT_RESET
+  #define MSGFLT_RESET (0)
+  #define MSGFLT_ALLOW (1)
+  #define MSGFLT_DISALLOW (2)
+#endif
+typedef WINBOOL WINAPI (*PChangeWindowMessageFilterEx)(HWND hwnd, UINT message, DWORD action, void * pChangeFilterStruct);
+PChangeWindowMessageFilterEx _ChangeWindowMessageFilterEx = NULL;
+
 static void RegisterTrayIcon()
 {
   // register our TrayIcon
@@ -232,7 +241,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
   app.trayRestartMsg = RegisterWindowMessage("TaskbarCreated");
 
   app.messageWnd = CreateWindowEx(0, MAKEINTATOM(class), NULL, 0, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
-  ChangeWindowMessageFilterEx(app.messageWnd, app.trayRestartMsg, MSGFLT_ALLOW, NULL);
+
+  // this is needed so that unprivileged processes can send us this message
+  HMODULE user32 = GetModuleHandle("user32.dll");
+  _ChangeWindowMessageFilterEx = (PChangeWindowMessageFilterEx)GetProcAddress(user32, "ChangeWindowMessageFilterEx");
+  if (_ChangeWindowMessageFilterEx)
+    _ChangeWindowMessageFilterEx(app.messageWnd, app.trayRestartMsg, MSGFLT_ALLOW, NULL);
 
   // set the global
   MessageHWND = app.messageWnd;
