@@ -26,6 +26,8 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "common/event.h"
 
 #include <assert.h>
+#include <stdatomic.h>
+#include <unistd.h>
 #include <dxgi.h>
 #include <d3d11.h>
 #include <d3dcommon.h>
@@ -55,7 +57,7 @@ enum TextureState
 
 typedef struct Texture
 {
-  enum TextureState          state;
+  volatile enum TextureState state;
   ID3D11Texture2D          * tex;
   D3D11_MAPPED_SUBRESOURCE   map;
 }
@@ -82,7 +84,7 @@ struct iface
   Texture                  * texture;
   int                        texRIndex;
   int                        texWIndex;
-  volatile int               texReady;
+  atomic_int                 texReady;
   bool                       needsRelease;
 
   CaptureGetPointerBuffer    getPointerBufferFn;
@@ -202,8 +204,8 @@ static bool dxgi_init()
   {
     DEBUG_INFO("The above error(s) will prevent LG from being able to capture the secure desktop (UAC dialogs)");
     DEBUG_INFO("This is not a failure, please do not report this as an issue.");
-    DEBUG_INFO("To fix this run LG using the PsExec SysInternals tool from Microsoft.");
-    DEBUG_INFO("https://docs.microsoft.com/en-us/sysinternals/downloads/psexec");
+    DEBUG_INFO("To fix this, install and run the Looking Glass host as a service.");
+    DEBUG_INFO("looking-glass-host.exe InstallService");
   }
 
   // this is required for DXGI 1.5 support to function
@@ -228,9 +230,9 @@ static bool dxgi_init()
   this->stop       = false;
   this->texRIndex  = 0;
   this->texWIndex  = 0;
-  this->texReady   = 0;
+  atomic_store(&this->texReady, 0);
 
-  lgResetEvent(this->frameEvent  );
+  lgResetEvent(this->frameEvent);
 
   status = CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&this->factory);
   if (FAILED(status))
@@ -408,9 +410,10 @@ static bool dxgi_init()
         status = fn(GetCurrentProcess(), D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME);
         if (FAILED(status))
         {
-          DEBUG_INFO("Failed to set realtime GPU priority, this is not an error!");
-          DEBUG_INFO("To fix this run LG using the PsExec SysInternals tool from Microsoft.");
-          DEBUG_INFO("https://docs.microsoft.com/en-us/sysinternals/downloads/psexec");
+          DEBUG_WARN("Failed to set realtime GPU priority.");
+          DEBUG_INFO("This is not a failure, please do not report this as an issue.");
+          DEBUG_INFO("To fix this, install and run the Looking Glass host as a service.");
+          DEBUG_INFO("looking-glass-host.exe InstallService");
         }
       }
     }
@@ -704,6 +707,15 @@ static CaptureResult dxgi_capture()
   DXGI_OUTDUPL_FRAME_INFO   frameInfo;
   IDXGIResource           * res;
 
+  bool copyFrame   = false;
+  bool copyPointer = false;
+  ID3D11Texture2D * src;
+
+  bool           postPointer      = false;
+  CapturePointer pointer          = { 0 };
+  void *         pointerShape     = NULL;
+  UINT           pointerShapeSize = 0;
+
   // release the prior frame
   result = dxgi_releaseFrame();
   if (result != CAPTURE_RESULT_OK)
@@ -735,7 +747,7 @@ static CaptureResult dxgi_capture()
     // check if the texture is free, if not skip the frame to keep up
     if (tex->state == TEXTURE_STATE_UNUSED)
     {
-      ID3D11Texture2D * src;
+      copyFrame = true;
       status = IDXGIResource_QueryInterface(res, &IID_ID3D11Texture2D, (void **)&src);
       if (FAILED(status))
       {
@@ -743,19 +755,49 @@ static CaptureResult dxgi_capture()
         IDXGIResource_Release(res);
         return CAPTURE_RESULT_ERROR;
       }
+    }
+  }
 
-      LOCKED({
-        // issue the copy from GPU to CPU RAM and release the src
+  // if the pointer shape has changed
+  uint32_t bufferSize;
+  if (frameInfo.PointerShapeBufferSize > 0)
+  {
+    if(!this->getPointerBufferFn(&pointerShape, &bufferSize))
+      DEBUG_WARN("Failed to obtain a buffer for the pointer shape");
+    else
+      copyPointer = true;
+  }
+
+  if (copyFrame || copyPointer)
+  {
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO shapeInfo;
+    LOCKED(
+    {
+      if (copyFrame)
+      {
+        // issue the copy from GPU to CPU RAM
         ID3D11DeviceContext_CopyResource(this->deviceContext,
           (ID3D11Resource *)tex->tex, (ID3D11Resource *)src);
-      });
+      }
 
+      if (copyPointer)
+      {
+        // grab the pointer shape
+        status = IDXGIOutputDuplication_GetFramePointerShape(
+            this->dup, bufferSize, pointerShape, &pointerShapeSize, &shapeInfo);
+      }
+
+      ID3D11DeviceContext_Flush(this->deviceContext);
+    });
+
+    if (copyFrame)
+    {
       ID3D11Texture2D_Release(src);
 
       // set the state, and signal
       tex->state = TEXTURE_STATE_PENDING_MAP;
-      INTERLOCKED_INC(&this->texReady);
-      lgSignalEvent(this->frameEvent);
+      if (atomic_fetch_add_explicit(&this->texReady, 1, memory_order_relaxed) == 0)
+        lgSignalEvent(this->frameEvent);
 
       // advance the write index
       if (++this->texWIndex == this->maxTextures)
@@ -764,51 +806,9 @@ static CaptureResult dxgi_capture()
       // update the last frame time
       this->frameTime.QuadPart = frameInfo.LastPresentTime.QuadPart;
     }
-  }
 
-  IDXGIResource_Release(res);
-
-  // if the pointer has moved or changed state
-  bool           postPointer      = false;
-  CapturePointer pointer          = { 0 };
-  void *         pointerShape     = NULL;
-  UINT           pointerShapeSize = 0;
-
-  if (frameInfo.LastMouseUpdateTime.QuadPart)
-  {
-    /* the pointer position is only valid if the pointer is visible */
-    if (frameInfo.PointerPosition.Visible &&
-      (frameInfo.PointerPosition.Position.x != this->lastPointerX ||
-       frameInfo.PointerPosition.Position.y != this->lastPointerY))
+    if (copyPointer)
     {
-      pointer.positionUpdate = true;
-      pointer.x =
-        this->lastPointerX =
-        frameInfo.PointerPosition.Position.x;
-      pointer.y =
-        this->lastPointerY =
-        frameInfo.PointerPosition.Position.y;
-      postPointer = true;
-    }
-
-    if (this->lastPointerVisible != frameInfo.PointerPosition.Visible)
-    {
-      this->lastPointerVisible = frameInfo.PointerPosition.Visible;
-      postPointer = true;
-    }
-  }
-
-  // if the pointer shape has changed
-  if (frameInfo.PointerShapeBufferSize > 0)
-  {
-    uint32_t bufferSize;
-    if(!this->getPointerBufferFn(&pointerShape, &bufferSize))
-      DEBUG_WARN("Failed to obtain a buffer for the pointer shape");
-    else
-    {
-      DXGI_OUTDUPL_POINTER_SHAPE_INFO shapeInfo;
-
-      LOCKED({status = IDXGIOutputDuplication_GetFramePointerShape(this->dup, bufferSize, pointerShape, &pointerShapeSize, &shapeInfo);});
       result = dxgi_hResultToCaptureResult(status);
       if (result != CAPTURE_RESULT_OK)
       {
@@ -835,6 +835,32 @@ static CaptureResult dxgi_capture()
     }
   }
 
+  IDXGIResource_Release(res);
+
+  if (frameInfo.LastMouseUpdateTime.QuadPart)
+  {
+    /* the pointer position is only valid if the pointer is visible */
+    if (frameInfo.PointerPosition.Visible &&
+      (frameInfo.PointerPosition.Position.x != this->lastPointerX ||
+       frameInfo.PointerPosition.Position.y != this->lastPointerY))
+    {
+      pointer.positionUpdate = true;
+      pointer.x =
+        this->lastPointerX =
+        frameInfo.PointerPosition.Position.x;
+      pointer.y =
+        this->lastPointerY =
+        frameInfo.PointerPosition.Position.y;
+      postPointer = true;
+    }
+
+    if (this->lastPointerVisible != frameInfo.PointerPosition.Visible)
+    {
+      this->lastPointerVisible = frameInfo.PointerPosition.Visible;
+      postPointer = true;
+    }
+  }
+
   // post back the pointer information
   if (postPointer)
   {
@@ -851,27 +877,39 @@ static CaptureResult dxgi_waitFrame(CaptureFrame * frame)
   assert(this->initialized);
 
   // NOTE: the event may be signaled when there are no frames available
-  if(this->texReady == 0)
+  if(atomic_load_explicit(&this->texReady, memory_order_acquire) == 0)
   {
     if (!lgWaitEvent(this->frameEvent, 1000))
       return CAPTURE_RESULT_TIMEOUT;
 
-    if (this->texReady == 0)
+    // the count will still be zero if we are stopping
+    if(atomic_load_explicit(&this->texReady, memory_order_acquire) == 0)
       return CAPTURE_RESULT_TIMEOUT;
   }
 
   Texture * tex = &this->texture[this->texRIndex];
 
   // try to map the resource, but don't wait for it
-  HRESULT status;
-  LOCKED({status = ID3D11DeviceContext_Map(this->deviceContext, (ID3D11Resource*)tex->tex, 0, D3D11_MAP_READ, 0x100000L, &tex->map);});
-  if (status == DXGI_ERROR_WAS_STILL_DRAWING)
-    return CAPTURE_RESULT_TIMEOUT;
-
-  if (FAILED(status))
+  for (int i = 0; ; ++i)
   {
-    DEBUG_WINERROR("Failed to map the texture", status);
-    return CAPTURE_RESULT_ERROR;
+    HRESULT status;
+    LOCKED({status = ID3D11DeviceContext_Map(this->deviceContext, (ID3D11Resource*)tex->tex, 0, D3D11_MAP_READ, 0x100000L, &tex->map);});
+    if (status == DXGI_ERROR_WAS_STILL_DRAWING)
+    {
+      if (i == 100)
+        return CAPTURE_RESULT_TIMEOUT;
+
+      usleep(1);
+      continue;
+    }
+
+    if (FAILED(status))
+    {
+      DEBUG_WINERROR("Failed to map the texture", status);
+      return CAPTURE_RESULT_ERROR;
+    }
+
+    break;
   }
 
   tex->state = TEXTURE_STATE_MAPPED;
@@ -882,7 +920,7 @@ static CaptureResult dxgi_waitFrame(CaptureFrame * frame)
   frame->stride = this->stride;
   frame->format = this->format;
 
-  INTERLOCKED_DEC(&this->texReady);
+  atomic_fetch_sub_explicit(&this->texReady, 1, memory_order_release);
   return CAPTURE_RESULT_OK;
 }
 

@@ -32,7 +32,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "common/locking.h"
 #include "common/thread.h"
 
-#define ID_MENU_OPEN_LOG 3000
+#define ID_MENU_SHOW_LOG 3000
 #define ID_MENU_EXIT     3001
 
 struct AppState
@@ -113,13 +113,19 @@ LRESULT CALLBACK DummyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         );
 
              if (clicked == ID_MENU_EXIT    ) app_quit();
-        else if (clicked == ID_MENU_OPEN_LOG)
+        else if (clicked == ID_MENU_SHOW_LOG)
         {
           const char * logFile = option_get_string("os", "logFile");
           if (strcmp(logFile, "stderr") == 0)
             DEBUG_INFO("Ignoring request to open the logFile, logging to stderr");
           else
-            ShellExecute(NULL, NULL, logFile, NULL, NULL, SW_SHOWNORMAL);
+          {
+            /* If LG is running as SYSTEM, ShellExecute would launch a process
+             * as the SYSTEM user also, for security we will just show the file
+             * location instead */
+            //ShellExecute(NULL, NULL, logFile, NULL, NULL, SW_SHOWNORMAL);
+            MessageBoxA(hwnd, logFile, "Log File Location", MB_OK | MB_ICONINFORMATION);
+          }
         }
       }
       break;
@@ -252,9 +258,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
   MessageHWND = app.messageWnd;
 
   app.trayMenu = CreatePopupMenu();
-  AppendMenu(app.trayMenu, MF_STRING   , ID_MENU_OPEN_LOG, "Open Log File");
-  AppendMenu(app.trayMenu, MF_SEPARATOR, 0               , NULL           );
-  AppendMenu(app.trayMenu, MF_STRING   , ID_MENU_EXIT    , "Exit"         );
+  AppendMenu(app.trayMenu, MF_STRING   , ID_MENU_SHOW_LOG, "Log File Location");
+  AppendMenu(app.trayMenu, MF_SEPARATOR, 0               , NULL               );
+  AppendMenu(app.trayMenu, MF_STRING   , ID_MENU_EXIT    , "Exit"             );
 
   // create the application thread
   LGThread * thread;

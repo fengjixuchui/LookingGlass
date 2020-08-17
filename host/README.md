@@ -20,8 +20,8 @@ Currently only Windows is supported however there is some initial support for Li
 6. configure the project and build it
 
 ```
-mkdir LookingGlass/c-host/build
-cd LookingGlass/c-host/build
+mkdir LookingGlass/host/build
+cd LookingGlass/host/build
 cmake -G "MSYS Makefiles" ..
 make
 ```
@@ -44,17 +44,46 @@ cmake -DCMAKE_TOOLCHAIN_FILE=../toolchain-mingw64.cmake ..
 make
 ```
 
+## Building the Windows installer
+
+Install NSIS compiler
+Build the host program, see above sections.
+Build installer with `makensis platform/Windows/installer.nsi`
+The resulting installer will be at
+`platform/Windows/looking-glass-host-setup.exe`
+
 ## Where is the log?
 
 It is in your user's temp directory:
 
     %TEMP%\looking-glass-host.txt
 
-For example:
+Or if running as a system service it will be located in:
 
-    C:\Users\YourUser\AppData\Local\Temp\looking-glass-host.txt
+    C:\Windows\Temp\looking-glass-host.txt
 
-You can also open it by simply right clicking the tray icon and selecting "Open Log File"
+You can find out where the file is by right clicking on the tray icon and
+selecting "Log File Location"
+
+### High priority capture using DXGI and Secure Desktop (UAC) capture support
+
+By default Windows gives priority to the foreground application for any GPU
+work which causes issues with capture if the foreground application is consuming
+100% of the available GPU resources. The looking glass host application is able
+to increase the kernel GPU thread to realtime priority which fixes this, but in
+order to do so it must run as the `SYSTEM` user account. To do this, Looking
+Glass needs to run as a service. This can be accomplished by either using the
+NSIS installer which will do this for you, or you can use the following command
+to Install the service manually:
+
+    looking-glass-host.exe InstallService
+
+To remove the service use the following command:
+
+    looking-glass-host.exe UninstallService
+
+This will also enable the host application to capture the secure desktop which
+includes things like the lock screen and UAC prompts.
 
 ## Why does this version require Administrator privileges
 
