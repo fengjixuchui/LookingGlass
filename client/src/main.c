@@ -213,12 +213,16 @@ static int renderThread(void * unused)
         if (atomic_fetch_sub_explicit(&a_framesPending, 1, memory_order_release) > 1)
           continue;
 
-      if (lgWaitEventAbs(e_frame, &time))
+      if (lgWaitEventAbs(e_frame, &time) && state.frameTime > 0)
       {
-        if (state.frameTime > 0)
+        /* only resync the timer if we got an early frame */
+        struct timespec now, diff;
+        clock_gettime(CLOCK_REALTIME, &now);
+        tsDiff(&diff, &now, &time);
+        if (diff.tv_sec == 0 && diff.tv_nsec < state.frameTime)
         {
           resyncCheck = 0;
-          clock_gettime(CLOCK_REALTIME, &time);
+          memcpy(&time, &now, sizeof(struct timespec));
           tsAdd(&time, state.frameTime);
         }
       }
@@ -277,10 +281,12 @@ static int cursorThread(void * unused)
           state.lgr->on_mouse_event
           (
             state.lgrData,
-            state.cursorVisible && state.drawCursor && state.cursorInView,
+            state.cursorVisible && state.drawCursor,
             state.cursor.x,
             state.cursor.y
           );
+
+          lgSignalEvent(e_frame);
         }
 
         usleep(params.cursorPollInterval);
@@ -302,19 +308,6 @@ static int cursorThread(void * unused)
     state.cursorVisible =
       msg.udata & CURSOR_FLAG_VISIBLE;
 
-    if (msg.udata & CURSOR_FLAG_POSITION)
-    {
-      state.cursor.x      = cursor->x;
-      state.cursor.y      = cursor->y;
-      state.haveCursorPos = true;
-
-      if (!state.haveAligned && state.haveSrcSize && state.haveCurLocal)
-      {
-        alignMouseWithHost();
-        state.haveAligned = true;
-      }
-    }
-
     if (msg.udata & CURSOR_FLAG_SHAPE)
     {
       switch(cursor->type)
@@ -327,6 +320,9 @@ static int cursorThread(void * unused)
           lgmpClientMessageDone(queue);
           continue;
       }
+
+      state.cursor.hx = cursor->hx;
+      state.cursor.hy = cursor->hy;
 
       const uint8_t * data = (const uint8_t *)(cursor + 1);
       if (!state.lgr->on_mouse_shape(
@@ -344,6 +340,16 @@ static int cursorThread(void * unused)
       }
     }
 
+    if (msg.udata & CURSOR_FLAG_POSITION)
+    {
+      state.cursor.x      = cursor->x;
+      state.cursor.y      = cursor->y;
+      state.haveCursorPos = true;
+
+      if (state.haveSrcSize && state.haveCurLocal && !state.serverMode)
+        alignMouseWithGuest();
+    }
+
     lgmpClientMessageDone(queue);
     state.updateCursor = false;
 
@@ -354,6 +360,9 @@ static int cursorThread(void * unused)
       state.cursor.x,
       state.cursor.y
     );
+
+    if (params.mouseRedraw)
+      lgSignalEvent(e_frame);
   }
 
   lgmpClientUnsubscribe(&queue);
@@ -668,10 +677,22 @@ void spiceClipboardRequest(const SpiceDataType type)
     state.lgc->request(spice_type_to_clipboard_type(type));
 }
 
+static void warpMouse(int x, int y)
+{
+  if (state.warpState != WARP_STATE_ON)
+    return;
+
+  state.warpFromX = state.curLastX;
+  state.warpFromY = state.curLastY;
+  state.warpToX   = x;
+  state.warpToY   = y;
+  state.warpState = WARP_STATE_ACTIVE;
+
+  SDL_WarpMouseInWindow(state.window, x, y);
+}
+
 static void handleMouseMoveEvent(int ex, int ey)
 {
-  static bool wrapping = false;
-  static int  wrapX, wrapY;
 
   state.curLocalX    = ex;
   state.curLocalY    = ey;
@@ -680,28 +701,23 @@ static void handleMouseMoveEvent(int ex, int ey)
   if (state.ignoreInput || !params.useSpiceInput)
     return;
 
+  if (state.warpState == WARP_STATE_ACTIVE)
+  {
+    if (ex == state.warpToX && ey == state.warpToY)
+    {
+      state.curLastX += state.warpToX - state.warpFromX;
+      state.curLastY += state.warpToY - state.warpFromY;
+      state.warpState = WARP_STATE_ON;
+    }
+  }
+
   if (state.serverMode)
   {
-    if (wrapping)
+    if (
+        ex < 100 || ex > state.windowW - 100 ||
+        ey < 100 || ey > state.windowH - 100)
     {
-      if (ex == state.windowW / 2 && ey == state.windowH / 2)
-      {
-        state.curLastX += (state.windowW / 2) - wrapX;
-        state.curLastY += (state.windowH / 2) - wrapY;
-        wrapping = false;
-      }
-    }
-    else
-    {
-      if (
-          ex < 100 || ex > state.windowW - 100 ||
-          ey < 100 || ey > state.windowH - 100)
-      {
-        wrapping = true;
-        wrapX    = ex;
-        wrapY    = ey;
-        SDL_WarpMouseInWindow(state.window, state.windowW / 2, state.windowH / 2);
-      }
+      warpMouse(state.windowW / 2, state.windowH / 2);
     }
   }
   else
@@ -713,6 +729,10 @@ static void handleMouseMoveEvent(int ex, int ey)
     {
       state.cursorInView = false;
       state.updateCursor = true;
+      state.warpState    = WARP_STATE_OFF;
+
+      if (params.useSpiceInput)
+        state.drawCursor = false;
       return;
     }
   }
@@ -721,6 +741,9 @@ static void handleMouseMoveEvent(int ex, int ey)
   {
     state.cursorInView = true;
     state.updateCursor = true;
+    state.drawCursor   = true;
+    if (state.warpState == WARP_STATE_ARMED)
+      state.warpState = WARP_STATE_ON;
   }
 
   int rx = ex - state.curLastX;
@@ -760,9 +783,9 @@ static void alignMouseWithGuest()
   if (state.ignoreInput || !params.useSpiceInput)
     return;
 
-  state.curLastX = (int)round((float)state.cursor.x / state.scaleX) + state.dstRect.x;
-  state.curLastY = (int)round((float)state.cursor.y / state.scaleY) + state.dstRect.y;
-  SDL_WarpMouseInWindow(state.window, state.curLastX, state.curLastY);
+  state.curLastX = (int)round((float)(state.cursor.x + state.cursor.hx) / state.scaleX) + state.dstRect.x;
+  state.curLastY = (int)round((float)(state.cursor.y + state.cursor.hy) / state.scaleY) + state.dstRect.y;
+  warpMouse(state.curLastX, state.curLastY);
 }
 
 static void alignMouseWithHost()
@@ -773,8 +796,8 @@ static void alignMouseWithHost()
   if (!state.haveCursorPos || state.serverMode)
     return;
 
-  state.curLastX = (int)round((float)state.cursor.x / state.scaleX) + state.dstRect.x;
-  state.curLastY = (int)round((float)state.cursor.y / state.scaleY) + state.dstRect.y;
+  state.curLastX = (int)round((float)(state.cursor.x + state.cursor.hx) / state.scaleX) + state.dstRect.x;
+  state.curLastY = (int)round((float)(state.cursor.y + state.cursor.hy) / state.scaleY) + state.dstRect.y;
   handleMouseMoveEvent(state.curLocalX, state.curLocalY);
 }
 
@@ -796,6 +819,7 @@ static void handleWindowLeave()
   state.drawCursor   = false;
   state.cursorInView = false;
   state.updateCursor = true;
+  state.warpState    = WARP_STATE_OFF;
 }
 
 static void handleWindowEnter()
@@ -806,6 +830,7 @@ static void handleWindowEnter()
   alignMouseWithHost();
   state.drawCursor   = true;
   state.updateCursor = true;
+  state.warpState    = WARP_STATE_ARMED;
 }
 
 int eventFilter(void * userdata, SDL_Event * event)
@@ -948,7 +973,9 @@ int eventFilter(void * userdata, SDL_Event * event)
               state.serverMode ? "Capture Enabled" : "Capture Disabled"
             );
 
-            if (!state.serverMode)
+            if (state.serverMode)
+              state.warpState = WARP_STATE_ON;
+            else
               alignMouseWithGuest();
           }
         }
@@ -1331,13 +1358,15 @@ static int lg_run()
   // ensure renderer viewport is aware of the current window size
   updatePositionInfo();
 
-  // use a default of 60FPS now that frame updates are host update triggered
   if (params.fpsMin == -1)
-    state.frameTime = 1e9 / 60;
+  {
+      // minimum 60fps to keep interactivity decent
+      state.frameTime = 1000000000ULL / 60ULL;
+  }
   else
   {
       DEBUG_INFO("Using the FPS minimum from args: %d", params.fpsMin);
-      state.frameTime = 1e9 / params.fpsMin;
+      state.frameTime = 1000000000ULL / (unsigned long long)params.fpsMin;
   }
 
   register_key_binds();

@@ -36,6 +36,20 @@ enum RunState
   APP_STATE_SHUTDOWN
 };
 
+struct CursorInfo
+{
+  int x , y;
+  int hx, hy;
+};
+
+enum WarpState
+{
+  WARP_STATE_ARMED,
+  WARP_STATE_ON,
+  WARP_STATE_ACTIVE,
+  WARP_STATE_OFF
+};
+
 struct AppState
 {
   enum RunState        state;
@@ -49,7 +63,7 @@ struct AppState
   int                  windowW, windowH;
   SDL_Point            srcSize;
   LG_RendererRect      dstRect;
-  SDL_Point            cursor;
+  struct CursorInfo    cursor;
   bool                 cursorVisible;
 
   bool  serverMode;
@@ -66,6 +80,10 @@ struct AppState
   int   curLocalX;
   int   curLocalY;
   bool  haveAligned;
+
+  enum WarpState   warpState;
+  int   warpFromX, warpFromY;
+  int   warpToX  , warpToY;
 
   const LG_Renderer  * lgr;
   void               * lgrData;
@@ -142,6 +160,7 @@ struct AppParams
 
   const char * windowTitle;
   int          mouseSens;
+  bool         mouseRedraw;
 };
 
 struct CBRequest
