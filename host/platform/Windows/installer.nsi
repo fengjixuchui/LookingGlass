@@ -36,7 +36,7 @@ InstallDir "$PROGRAMFILES64\Looking Glass (host)"
 !define MUI_ICON "icon.ico"
 !define MUI_UNICON "icon.ico"
 !define MUI_LICENSEPAGE_BUTTON "Agree"
-!define /file VERSION "VERSION"
+!define /file VERSION "../../VERSION"
 
 ;Install and uninstall pages
 !insertmacro MUI_PAGE_LICENSE "LICENSE.txt"
@@ -134,7 +134,7 @@ Section "-Install" Section1
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Looking Glass (host)" \
   "NoModify" "1"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Looking Glass (host)" \
-    "DisplayVersion" ${VERSION}
+  "DisplayVersion" ${VERSION}
 
 SectionEnd
 

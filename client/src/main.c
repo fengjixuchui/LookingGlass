@@ -50,6 +50,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "common/event.h"
 #include "common/ivshmem.h"
 #include "common/time.h"
+#include "common/version.h"
 
 #include "utils.h"
 #include "kb.h"
@@ -1283,7 +1284,8 @@ static int lg_run()
 
   // select and init a renderer
   LG_RendererParams lgrParams;
-  lgrParams.showFPS = params.showFPS;
+  lgrParams.showFPS     = params.showFPS;
+  lgrParams.quickSplash = params.quickSplash;
   Uint32 sdlFlags;
 
   if (params.forceRenderer)
@@ -1672,7 +1674,7 @@ int main(int argc, char * argv[])
     return -1;
   }
 
-  DEBUG_INFO("Looking Glass (" BUILD_VERSION ")");
+  DEBUG_INFO("Looking Glass (%s)", BUILD_VERSION);
   DEBUG_INFO("Locking Method: " LG_LOCK_MODE);
 
   if (!installCrashHandler("/proc/self/exe"))
