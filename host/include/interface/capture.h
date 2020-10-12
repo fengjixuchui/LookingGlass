@@ -35,10 +35,11 @@ CaptureResult;
 typedef enum CaptureFormat
 {
   // frame formats
-  CAPTURE_FMT_BGRA  ,
-  CAPTURE_FMT_RGBA  ,
-  CAPTURE_FMT_RGBA10,
-  CAPTURE_FMT_YUV420,
+  CAPTURE_FMT_BGRA   ,
+  CAPTURE_FMT_RGBA   ,
+  CAPTURE_FMT_RGBA10 ,
+  CAPTURE_FMT_RGBA16F,
+  CAPTURE_FMT_YUV420 ,
 
   // pointer formats
   CAPTURE_FMT_COLOR ,
@@ -51,6 +52,7 @@ CaptureFormat;
 
 typedef struct CaptureFrame
 {
+  unsigned int   formatVer;
   unsigned int   width;
   unsigned int   height;
   unsigned int   pitch;

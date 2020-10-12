@@ -29,10 +29,13 @@ typedef enum FrameType
   FRAME_TYPE_BGRA      , // BGRA interleaved: B,G,R,A 32bpp
   FRAME_TYPE_RGBA      , // RGBA interleaved: R,G,B,A 32bpp
   FRAME_TYPE_RGBA10    , // RGBA interleaved: R,G,B,A 10,10,10,2 bpp
+  FRAME_TYPE_RGBA16F   , // RGBA interleaved: R,G,B,A 16,16,16,16 bpp float
   FRAME_TYPE_YUV420    , // YUV420
   FRAME_TYPE_MAX       , // sentinel value
 }
 FrameType;
+
+extern const char * FrameTypeStr[FRAME_TYPE_MAX];
 
 enum
 {
@@ -51,7 +54,7 @@ typedef enum CursorType
 CursorType;
 
 #define KVMFR_MAGIC   "KVMFR---"
-#define KVMFR_VERSION 3
+#define KVMFR_VERSION 5
 
 typedef struct KVMFR
 {
@@ -74,6 +77,7 @@ KVMFRCursor;
 
 typedef struct KVMFRFrame
 {
+  uint32_t  formatVer;   // the frame format version number
   FrameType type;        // the frame data type
   uint32_t  width;       // the width
   uint32_t  height;      // the height

@@ -219,6 +219,19 @@ bool egl_texture_setup(EGL_Texture * texture, enum EGL_PixelFormat pixFmt, size_
       texture->pboBufferSize = height * stride;
       break;
 
+    case EGL_PF_RGBA16F:
+      planeCount             = 1;
+      texture->bpp           = 8;
+      texture->format        = GL_RGBA;
+      texture->planes[0][0]  = width;
+      texture->planes[0][1]  = height;
+      texture->planes[0][2]  = stride / 8;
+      texture->offsets[0]    = 0;
+      texture->intFormat     = GL_RGBA16F;
+      texture->dataType      = GL_HALF_FLOAT;
+      texture->pboBufferSize = height * stride;
+      break;
+
     case EGL_PF_YUV420:
       planeCount             = 3;
       texture->bpp           = 4;
@@ -338,7 +351,7 @@ bool egl_texture_update(EGL_Texture * texture, const uint8_t * buffer)
     for(int p = 0; p < texture->planeCount; ++p)
     {
       glBindTexture(GL_TEXTURE_2D, texture->tex[0].t[p]);
-      glPixelStorei(GL_UNPACK_ROW_LENGTH, texture->planes[p][0]);
+      glPixelStorei(GL_UNPACK_ROW_LENGTH, texture->planes[p][2]);
       glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, texture->planes[p][0], texture->planes[p][1],
           texture->format, texture->dataType, buffer + texture->offsets[p]);
     }

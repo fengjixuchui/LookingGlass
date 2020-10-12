@@ -92,6 +92,17 @@ static void updatePositionInfo()
       const float wndAspect = (float)state.windowH / (float)state.windowW;
       bool force = true;
 
+      if (params.dontUpscale &&
+          state.srcSize.x <= state.windowW &&
+          state.srcSize.y <= state.windowH)
+      {
+        force = false;
+        state.dstRect.w = state.srcSize.x;
+        state.dstRect.h = state.srcSize.y;
+        state.dstRect.x = state.windowW / 2 - state.srcSize.x / 2;
+        state.dstRect.y = state.windowH / 2 - state.srcSize.y / 2;
+      }
+      else
       if ((int)(wndAspect * 1000) == (int)(srcAspect * 1000))
       {
         force           = false;
@@ -375,6 +386,10 @@ static int frameThread(void * unused)
   LGMP_STATUS      status;
   PLGMPClientQueue queue;
 
+  uint32_t          formatVer = 0;
+  bool              formatValid = false;
+  LG_RendererFormat lgrFormat;
+
   SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
   lgWaitEvent(e_startup, TIMEOUT_INFINITE);
   if (state.state != APP_STATE_RUNNING)
@@ -421,59 +436,82 @@ static int frameThread(void * unused)
 
     KVMFRFrame * frame = (KVMFRFrame *)msg.mem;
 
-    // setup the renderer format with the frame format details
-    LG_RendererFormat lgrFormat;
-    lgrFormat.type   = frame->type;
-    lgrFormat.width  = frame->width;
-    lgrFormat.height = frame->height;
-    lgrFormat.stride = frame->stride;
-    lgrFormat.pitch  = frame->pitch;
-
-    size_t dataSize;
-    bool   error = false;
-    switch(frame->type)
+    if (!formatValid || frame->formatVer != formatVer)
     {
-      case FRAME_TYPE_RGBA:
-      case FRAME_TYPE_BGRA:
-      case FRAME_TYPE_RGBA10:
-        dataSize       = lgrFormat.height * lgrFormat.pitch;
-        lgrFormat.bpp  = 32;
-        break;
+      // setup the renderer format with the frame format details
+      lgrFormat.type   = frame->type;
+      lgrFormat.width  = frame->width;
+      lgrFormat.height = frame->height;
+      lgrFormat.stride = frame->stride;
+      lgrFormat.pitch  = frame->pitch;
 
-      case FRAME_TYPE_YUV420:
-        dataSize       = lgrFormat.height * lgrFormat.width;
-        dataSize      += (dataSize / 4) * 2;
-        lgrFormat.bpp  = 12;
-        break;
+      size_t dataSize;
+      bool   error = false;
+      switch(frame->type)
+      {
+        case FRAME_TYPE_RGBA:
+        case FRAME_TYPE_BGRA:
+        case FRAME_TYPE_RGBA10:
+          dataSize       = lgrFormat.height * lgrFormat.pitch;
+          lgrFormat.bpp  = 32;
+          break;
 
-      default:
-        DEBUG_ERROR("Unsupported frameType");
-        error = true;
+        case FRAME_TYPE_RGBA16F:
+          dataSize       = lgrFormat.height * lgrFormat.pitch;
+          lgrFormat.bpp  = 64;
+          break;
+
+        case FRAME_TYPE_YUV420:
+          dataSize       = lgrFormat.height * lgrFormat.width;
+          dataSize      += (dataSize / 4) * 2;
+          lgrFormat.bpp  = 12;
+          break;
+
+        default:
+          DEBUG_ERROR("Unsupported frameType");
+          error = true;
+          break;
+      }
+
+      if (error)
+      {
+        lgmpClientMessageDone(queue);
+        state.state = APP_STATE_SHUTDOWN;
         break;
+      }
+
+      formatValid = true;
+      formatVer   = frame->formatVer;
+
+      DEBUG_INFO("Format: %s %ux%u %u %u",
+          FrameTypeStr[frame->type],
+          frame->width, frame->height,
+          frame->stride, frame->pitch);
+
+      if (!state.lgr->on_frame_format(state.lgrData, lgrFormat))
+      {
+        DEBUG_ERROR("renderer failed to configure format");
+        state.state = APP_STATE_SHUTDOWN;
+        break;
+      }
     }
 
-    if (error)
+    if (lgrFormat.width != state.srcSize.x || lgrFormat.height != state.srcSize.y)
     {
-      lgmpClientMessageDone(queue);
-      state.state = APP_STATE_SHUTDOWN;
-      break;
-    }
-
-    if (frame->width != state.srcSize.x || frame->height != state.srcSize.y)
-    {
-      state.srcSize.x = frame->width;
-      state.srcSize.y = frame->height;
+      state.srcSize.x = lgrFormat.width;
+      state.srcSize.y = lgrFormat.height;
       state.haveSrcSize = true;
       if (params.autoResize)
-        SDL_SetWindowSize(state.window, frame->width, frame->height);
+        SDL_SetWindowSize(state.window, lgrFormat.width, lgrFormat.height);
 
       updatePositionInfo();
     }
 
     FrameBuffer * fb = (FrameBuffer *)(((uint8_t*)frame) + frame->offset);
-    if (!state.lgr->on_frame_event(state.lgrData, lgrFormat, fb))
+    if (!state.lgr->on_frame(state.lgrData, fb))
     {
-      DEBUG_ERROR("renderer on frame event returned failure");
+      lgmpClientMessageDone(queue);
+      DEBUG_ERROR("renderer on frame returned failure");
       state.state = APP_STATE_SHUTDOWN;
       break;
     }
