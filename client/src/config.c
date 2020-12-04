@@ -84,6 +84,13 @@ static struct Option options[] =
     .type          = OPTION_TYPE_INT,
     .value.x_int   = 1000
   },
+  {
+    .module        = "app",
+    .name          = "allowDMA",
+    .description   = "Allow direct DMA transfers if possible (VM-VM only for now)",
+    .type          = OPTION_TYPE_BOOL,
+    .value.x_bool  = true
+  },
 
   // window options
   {
@@ -239,6 +246,13 @@ static struct Option options[] =
   },
   {
     .module         = "input",
+    .name           = "grabKeyboardOnFocus",
+    .description    = "Grab the keyboard when focused",
+    .type           = OPTION_TYPE_BOOL,
+    .value.x_bool   = true,
+  },
+  {
+    .module         = "input",
     .name           = "escapeKey",
     .description    = "Specify the escape key, see https://wiki.libsdl.org/SDLScancodeLookup for valid values",
     .shortopt       = 'm',
@@ -337,6 +351,13 @@ static struct Option options[] =
     .type           = OPTION_TYPE_BOOL,
     .value.x_bool   = false
   },
+  {
+    .module         = "spice",
+    .name           = "alwaysShowCursor",
+    .description    = "Always show host cursor",
+    .type           = OPTION_TYPE_BOOL,
+    .value.x_bool   = false
+  },
   {0}
 };
 
@@ -401,6 +422,7 @@ bool config_load(int argc, char * argv[])
   // setup the application params for the basic types
   params.cursorPollInterval = option_get_int   ("app", "cursorPollInterval");
   params.framePollInterval  = option_get_int   ("app", "framePollInterval" );
+  params.allowDMA           = option_get_bool  ("app", "allowDMA"          );
 
   params.windowTitle   = option_get_string("win", "title"        );
   params.autoResize    = option_get_bool  ("win", "autoResize"   );
@@ -418,11 +440,12 @@ bool config_load(int argc, char * argv[])
   params.showAlerts    = option_get_bool  ("win", "alerts"       );
   params.quickSplash   = option_get_bool  ("win", "quickSplash"  );
 
-  params.grabKeyboard  = option_get_bool  ("input", "grabKeyboard");
-  params.escapeKey     = option_get_int   ("input", "escapeKey"   );
-  params.hideMouse     = option_get_bool  ("input", "hideCursor"  );
-  params.mouseSens     = option_get_int   ("input", "mouseSens"   );
-  params.mouseRedraw   = option_get_bool  ("input", "mouseRedraw" );
+  params.grabKeyboard        = option_get_bool  ("input", "grabKeyboard"       );
+  params.grabKeyboardOnFocus = option_get_bool  ("input", "grabKeyboardOnFocus");
+  params.escapeKey           = option_get_int   ("input", "escapeKey"          );
+  params.hideMouse           = option_get_bool  ("input", "hideCursor"         );
+  params.mouseSens           = option_get_int   ("input", "mouseSens"          );
+  params.mouseRedraw         = option_get_bool  ("input", "mouseRedraw"        );
 
   params.minimizeOnFocusLoss = option_get_bool("win", "minimizeOnFocusLoss");
 
@@ -445,6 +468,7 @@ bool config_load(int argc, char * argv[])
 
     params.scaleMouseInput = option_get_bool("spice", "scaleCursor");
     params.captureOnStart  = option_get_bool("spice", "captureOnStart");
+    params.alwaysShowCursor  = option_get_bool("spice", "alwaysShowCursor");
   }
 
   return true;

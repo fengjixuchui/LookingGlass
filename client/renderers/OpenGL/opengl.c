@@ -375,7 +375,7 @@ bool opengl_on_mouse_event(void * opaque, const bool visible, const int x, const
   return false;
 }
 
-bool opengl_on_frame_format(void * opaque, const LG_RendererFormat format)
+bool opengl_on_frame_format(void * opaque, const LG_RendererFormat format, bool useDMA)
 {
   struct Inst * this = (struct Inst *)opaque;
 
@@ -386,7 +386,7 @@ bool opengl_on_frame_format(void * opaque, const LG_RendererFormat format)
   return true;
 }
 
-bool opengl_on_frame(void * opaque, const FrameBuffer * frame)
+bool opengl_on_frame(void * opaque, const FrameBuffer * frame, int dmaFd)
 {
   struct Inst * this = (struct Inst *)opaque;
 

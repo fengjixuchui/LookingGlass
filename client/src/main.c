@@ -71,16 +71,26 @@ static LGThread *t_cursor  = NULL;
 static LGThread *t_frame   = NULL;
 static SDL_Cursor *cursor  = NULL;
 
-static atomic_uint a_framesPending = 0;
-
 struct AppState state;
 
 // this structure is initialized in config.c
 struct AppParams params = { 0 };
 
 static void handleMouseMoveEvent(int ex, int ey);
-static void alignMouseWithGuest();
 static void alignMouseWithHost();
+
+static void lgInit()
+{
+  state.state         = APP_STATE_RUNNING;
+  state.scale         = false;
+  state.scaleX        = 1.0f;
+  state.scaleY        = 1.0f;
+  state.resizeDone    = true;
+  state.drawCursor    = true;
+
+  state.haveCursorPos = false;
+  state.cursorInView  = true;
+}
 
 static void updatePositionInfo()
 {
@@ -142,6 +152,10 @@ static void updatePositionInfo()
     }
     state.dstRect.valid = true;
 
+    state.scale = (
+        state.srcSize.y != state.dstRect.h ||
+        state.srcSize.x != state.dstRect.w);
+
     state.scaleX = (float)state.srcSize.y / (float)state.dstRect.h;
     state.scaleY = (float)state.srcSize.x / (float)state.dstRect.w;
   }
@@ -163,19 +177,15 @@ static int renderThread(void * unused)
   /* signal to other threads that the renderer is ready */
   lgSignalEvent(e_startup);
 
-  int resyncCheck = 0;
   struct timespec time;
-  clock_gettime(CLOCK_REALTIME, &time);
+  clock_gettime(CLOCK_MONOTONIC, &time);
 
   while(state.state != APP_STATE_SHUTDOWN)
   {
-    if (state.frameTime > 0)
+    if (params.fpsMin != 0)
     {
-      if (++resyncCheck == 100)
-      {
-        resyncCheck = 0;
-        clock_gettime(CLOCK_REALTIME, &time);
-      }
+      lgWaitEventAbs(e_frame, &time);
+      clock_gettime(CLOCK_MONOTONIC, &time);
       tsAdd(&time, state.frameTime);
     }
 
@@ -198,11 +208,16 @@ static int renderThread(void * unused)
 
       if (state.renderTime > 1e9)
       {
-        const float avgUPS = 1000.0f / (((float)state.renderTime / atomic_load_explicit(&state.frameCount, memory_order_acquire)) / 1e6f);
-        const float avgFPS = 1000.0f / (((float)state.renderTime / state.renderCount) / 1e6f);
+        const float avgUPS = 1000.0f / (((float)state.renderTime /
+          atomic_exchange_explicit(&state.frameCount, 0, memory_order_acquire)) /
+          1e6f);
+
+        const float avgFPS = 1000.0f / (((float)state.renderTime /
+          state.renderCount) /
+          1e6f);
+
         state.lgr->update_fps(state.lgrData, avgUPS, avgFPS);
 
-        atomic_store_explicit(&state.frameCount, 0, memory_order_release);
         state.renderTime  = 0;
         state.renderCount = 0;
       }
@@ -216,28 +231,6 @@ static int renderThread(void * unused)
         state.dstRect.h
       );
       state.resizeDone = true;
-    }
-
-    if (state.frameTime > 0)
-    {
-      /* if there are frames pending already, don't wait on the event */
-      if (atomic_load_explicit(&a_framesPending, memory_order_acquire) > 0)
-        if (atomic_fetch_sub_explicit(&a_framesPending, 1, memory_order_release) > 1)
-          continue;
-
-      if (lgWaitEventAbs(e_frame, &time) && state.frameTime > 0)
-      {
-        /* only resync the timer if we got an early frame */
-        struct timespec now, diff;
-        clock_gettime(CLOCK_REALTIME, &now);
-        tsDiff(&diff, &now, &time);
-        if (diff.tv_sec == 0 && diff.tv_nsec < state.frameTime)
-        {
-          resyncCheck = 0;
-          memcpy(&time, &now, sizeof(struct timespec));
-          tsAdd(&time, state.frameTime);
-        }
-      }
     }
   }
 
@@ -357,9 +350,6 @@ static int cursorThread(void * unused)
       state.cursor.x      = cursor->x;
       state.cursor.y      = cursor->y;
       state.haveCursorPos = true;
-
-      if (state.haveSrcSize && state.haveCurLocal && !state.serverMode)
-        alignMouseWithGuest();
     }
 
     lgmpClientMessageDone(queue);
@@ -383,12 +373,30 @@ static int cursorThread(void * unused)
 
 static int frameThread(void * unused)
 {
+  struct DMAFrameInfo
+  {
+    KVMFRFrame * frame;
+    size_t       dataSize;
+    int          fd;
+  };
+
   LGMP_STATUS      status;
   PLGMPClientQueue queue;
 
   uint32_t          formatVer = 0;
   bool              formatValid = false;
+  size_t            dataSize;
   LG_RendererFormat lgrFormat;
+
+  struct DMAFrameInfo dmaInfo[LGMP_Q_FRAME_LEN] = {0};
+  const bool useDMA =
+    params.allowDMA &&
+    ivshmemHasDMA(&state.shm) &&
+    state.lgr->supports &&
+    state.lgr->supports(state.lgrData, LG_SUPPORTS_DMABUF);
+
+  if (useDMA)
+    DEBUG_INFO("Using DMA buffer support");
 
   SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
   lgWaitEvent(e_startup, TIMEOUT_INFINITE);
@@ -434,7 +442,8 @@ static int frameThread(void * unused)
       break;
     }
 
-    KVMFRFrame * frame = (KVMFRFrame *)msg.mem;
+    KVMFRFrame * frame       = (KVMFRFrame *)msg.mem;
+    struct DMAFrameInfo *dma = NULL;
 
     if (!formatValid || frame->formatVer != formatVer)
     {
@@ -445,8 +454,7 @@ static int frameThread(void * unused)
       lgrFormat.stride = frame->stride;
       lgrFormat.pitch  = frame->pitch;
 
-      size_t dataSize;
-      bool   error = false;
+      bool error = false;
       switch(frame->type)
       {
         case FRAME_TYPE_RGBA:
@@ -488,11 +496,59 @@ static int frameThread(void * unused)
           frame->width, frame->height,
           frame->stride, frame->pitch);
 
-      if (!state.lgr->on_frame_format(state.lgrData, lgrFormat))
+      if (!state.lgr->on_frame_format(state.lgrData, lgrFormat, useDMA))
       {
         DEBUG_ERROR("renderer failed to configure format");
         state.state = APP_STATE_SHUTDOWN;
         break;
+      }
+    }
+
+    if (useDMA)
+    {
+      /* find the existing dma buffer if it exists */
+      for(int i = 0; i < sizeof(dmaInfo) / sizeof(struct DMAFrameInfo); ++i)
+      {
+        if (dmaInfo[i].frame == frame)
+        {
+          dma = &dmaInfo[i];
+          /* if it's too small close it */
+          if (dma->dataSize < dataSize)
+          {
+            close(dma->fd);
+            dma->fd = -1;
+          }
+          break;
+        }
+      }
+
+      /* otherwise find a free buffer for use */
+      if (!dma)
+        for(int i = 0; i < sizeof(dmaInfo) / sizeof(struct DMAFrameInfo); ++i)
+        {
+          if (!dmaInfo[i].frame)
+          {
+            dma = &dmaInfo[i];
+            dma->frame = frame;
+            dma->fd    = -1;
+            break;
+          }
+        }
+
+      /* open the buffer */
+      if (dma->fd == -1)
+      {
+        const uintptr_t pos    = (uintptr_t)msg.mem - (uintptr_t)state.shm.mem;
+        const uintptr_t offset = (uintptr_t)frame->offset + FrameBufferStructSize;
+
+        dma->dataSize = dataSize;
+        dma->fd       = ivshmemGetDMABuf(&state.shm, pos + offset, dataSize);
+        if (dma->fd < 0)
+        {
+          DEBUG_ERROR("Failed to get the DMA buffer for the frame");
+          state.state = APP_STATE_SHUTDOWN;
+          break;
+        }
       }
     }
 
@@ -508,7 +564,7 @@ static int frameThread(void * unused)
     }
 
     FrameBuffer * fb = (FrameBuffer *)(((uint8_t*)frame) + frame->offset);
-    if (!state.lgr->on_frame(state.lgrData, fb))
+    if (!state.lgr->on_frame(state.lgrData, fb, useDMA ? dma->fd : -1))
     {
       lgmpClientMessageDone(queue);
       DEBUG_ERROR("renderer on frame returned failure");
@@ -517,14 +573,20 @@ static int frameThread(void * unused)
     }
 
     atomic_fetch_add_explicit(&state.frameCount, 1, memory_order_relaxed);
-    if (atomic_fetch_add_explicit(&a_framesPending, 1, memory_order_relaxed) == 0)
-      lgSignalEvent(e_frame);
-
+    lgSignalEvent(e_frame);
     lgmpClientMessageDone(queue);
   }
 
   lgmpClientUnsubscribe(&queue);
   state.lgr->on_restart(state.lgrData);
+
+  if (useDMA)
+  {
+    for(int i = 0; i < sizeof(dmaInfo) / sizeof(struct DMAFrameInfo); ++i)
+      if (dmaInfo[i].fd >= 0)
+        close(dmaInfo[i].fd);
+  }
+
 
   return 0;
 }
@@ -595,7 +657,7 @@ void clipboardRelease()
   spice_clipboard_release();
 }
 
-void clipboardNotify(const LG_ClipboardData type)
+void clipboardNotify(const LG_ClipboardData type, size_t size)
 {
   if (!params.clipboardToVM)
     return;
@@ -606,7 +668,14 @@ void clipboardNotify(const LG_ClipboardData type)
     return;
   }
 
-  spice_clipboard_grab(clipboard_type_to_spice_type(type));
+  state.cbType    = clipboard_type_to_spice_type(type);
+  state.cbChunked = size > 0;
+  state.cbXfer    = size;
+
+  spice_clipboard_grab(state.cbType);
+
+  if (size)
+    spice_clipboard_data_start(state.cbType, size);
 }
 
 void clipboardData(const LG_ClipboardData type, uint8_t * data, size_t size)
@@ -614,32 +683,17 @@ void clipboardData(const LG_ClipboardData type, uint8_t * data, size_t size)
   if (!params.clipboardToVM)
     return;
 
-  uint8_t * buffer = data;
-
-  // unix2dos
-  if (type == LG_CLIPBOARD_DATA_TEXT)
+  if (state.cbChunked && size > state.cbXfer)
   {
-    // TODO: make this more memory efficent
-    size_t newSize = 0;
-    buffer = malloc(size * 2);
-    uint8_t * p = buffer;
-    for(uint32_t i = 0; i < size; ++i)
-    {
-      uint8_t c = data[i];
-      if (c == '\n')
-      {
-        *p++ = '\r';
-        ++newSize;
-      }
-      *p++ = c;
-      ++newSize;
-    }
-    size = newSize;
+    DEBUG_ERROR("refusing to send more then cbXfer bytes for chunked xfer");
+    size = state.cbXfer;
   }
 
-  spice_clipboard_data(clipboard_type_to_spice_type(type), buffer, (uint32_t)size);
-  if (buffer != data)
-    free(buffer);
+  if (!state.cbChunked)
+    spice_clipboard_data_start(state.cbType, size);
+
+  spice_clipboard_data(state.cbType, data, (uint32_t)size);
+  state.cbXfer -= size;
 }
 
 void clipboardRequest(const LG_ClipboardReplyFn replyFn, void * opaque)
@@ -695,7 +749,7 @@ void spiceClipboardData(const SpiceDataType type, uint8_t * buffer, uint32_t siz
   struct CBRequest * cbr;
   if (ll_shift(state.cbRequestList, (void **)&cbr))
   {
-    cbr->replyFn(cbr->opaque, type, buffer, size);
+    cbr->replyFn(cbr->opaque, spice_type_to_clipboard_type(type), buffer, size);
     free(cbr);
   }
 }
@@ -720,62 +774,87 @@ void spiceClipboardRequest(const SpiceDataType type)
 
 static void warpMouse(int x, int y)
 {
-  if (state.warpState != WARP_STATE_ON)
+  if (!state.cursorInWindow)
     return;
 
-  state.warpFromX = state.curLastX;
-  state.warpFromY = state.curLastY;
-  state.warpToX   = x;
-  state.warpToY   = y;
-  state.warpState = WARP_STATE_ACTIVE;
+  if (state.warpState == WARP_STATE_WIN_EXIT)
+  {
+    SDL_WarpMouseInWindow(state.window, x, y);
+    state.warpState = WARP_STATE_OFF;
+    return;
+  }
 
-  SDL_WarpMouseInWindow(state.window, x, y);
+  if (state.warpState == WARP_STATE_ON)
+  {
+    state.warpToX   = x;
+    state.warpToY   = y;
+    state.warpState = WARP_STATE_ACTIVE;
+    SDL_WarpMouseInWindow(state.window, x, y);
+  }
+}
+
+static bool isValidCursorLocation(int x, int y)
+{
+  const int displays = SDL_GetNumVideoDisplays();
+  for(int i = 0; i < displays; ++i)
+  {
+    SDL_Rect r;
+    SDL_GetDisplayBounds(i, &r);
+    if ((x >= r.x && x < r.x + r.w) &&
+        (y >= r.y && y < r.y + r.h))
+      return true;
+  }
+  return false;
 }
 
 static void handleMouseMoveEvent(int ex, int ey)
 {
+  SDL_Point delta = {
+    .x = ex - state.curLastX,
+    .y = ey - state.curLastY
+  };
 
-  state.curLocalX    = ex;
-  state.curLocalY    = ey;
-  state.haveCurLocal = true;
-
-  if (state.ignoreInput || !params.useSpiceInput)
+  if (delta.x == 0 && delta.y == 0)
     return;
 
-  if (state.warpState == WARP_STATE_ACTIVE)
+  state.curLastX = state.curLocalX = ex;
+  state.curLastY = state.curLocalX = ey;
+  state.haveCurLocal = true;
+
+  if (state.warpState == WARP_STATE_ACTIVE &&
+      ex == state.warpToX && ey == state.warpToY)
   {
-    if (ex == state.warpToX && ey == state.warpToY)
-    {
-      state.curLastX += state.warpToX - state.warpFromX;
-      state.curLastY += state.warpToY - state.warpFromY;
-      state.warpState = WARP_STATE_ON;
-    }
+    state.warpState = WARP_STATE_ON;
+    return;
   }
 
-  if (state.serverMode)
+  if (!state.cursorInWindow || state.ignoreInput || !params.useSpiceInput)
+    return;
+
+  /* if we don't have the current cursor pos just send cursor movements */
+  if (!state.haveCursorPos)
   {
-    if (
-        ex < 100 || ex > state.windowW - 100 ||
-        ey < 100 || ey > state.windowH - 100)
+    state.cursorInView = true;
+    spice_mouse_motion(delta.x, delta.y);
+    if ((state.haveCursorPos || state.grabMouse) &&
+        (ex < 100 || ex > state.windowW - 100 ||
+         ey < 100 || ey > state.windowH - 100))
     {
       warpMouse(state.windowW / 2, state.windowH / 2);
     }
+    return;
   }
-  else
-  {
-    if (ex < state.dstRect.x                   ||
-        ex > state.dstRect.x + state.dstRect.w ||
-        ey < state.dstRect.y                   ||
-        ey > state.dstRect.y + state.dstRect.h)
-    {
-      state.cursorInView = false;
-      state.updateCursor = true;
-      state.warpState    = WARP_STATE_OFF;
 
-      if (params.useSpiceInput)
-        state.drawCursor = false;
-      return;
-    }
+  if (ex < state.dstRect.x                   ||
+      ex > state.dstRect.x + state.dstRect.w ||
+      ey < state.dstRect.y                   ||
+      ey > state.dstRect.y + state.dstRect.h)
+  {
+    state.cursorInView = false;
+    state.updateCursor = true;
+
+    if (params.useSpiceInput && !params.alwaysShowCursor)
+      state.drawCursor = false;
   }
 
   if (!state.cursorInView)
@@ -783,50 +862,87 @@ static void handleMouseMoveEvent(int ex, int ey)
     state.cursorInView = true;
     state.updateCursor = true;
     state.drawCursor   = true;
-    if (state.warpState == WARP_STATE_ARMED)
-      state.warpState = WARP_STATE_ON;
   }
 
-  int rx = ex - state.curLastX;
-  int ry = ey - state.curLastY;
-  state.curLastX = ex;
-  state.curLastY = ey;
+  if (state.scale && params.scaleMouseInput && !state.grabMouse)
+  {
+    state.accX += (float)delta.x * state.scaleX;
+    state.accY += (float)delta.y * state.scaleY;
+    delta.x = floor(state.accX);
+    delta.y = floor(state.accY);
+    state.accX -= delta.x;
+    state.accY -= delta.y;
+  }
 
-  if (rx == 0 && ry == 0)
+  if (state.grabMouse && state.mouseSens != 0)
+  {
+    state.sensX += ((float)delta.x / 10.0f) * (state.mouseSens + 10);
+    state.sensY += ((float)delta.y / 10.0f) * (state.mouseSens + 10);
+    delta.x = floor(state.sensX);
+    delta.y = floor(state.sensY);
+    state.sensX -= delta.x;
+    state.sensY -= delta.y;
+  }
+
+  if ((state.haveCursorPos || state.grabMouse) &&
+      (ex < 100 || ex > state.windowW - 100 ||
+       ey < 100 || ey > state.windowH - 100))
+  {
+    warpMouse(state.windowW / 2, state.windowH / 2);
     return;
-
-  if (params.scaleMouseInput && !state.serverMode)
-  {
-    state.accX += (float)rx * state.scaleX;
-    state.accY += (float)ry * state.scaleY;
-    rx = floor(state.accX);
-    ry = floor(state.accY);
-    state.accX -= rx;
-    state.accY -= ry;
   }
 
-  if (state.serverMode && state.mouseSens != 0)
+  if (!state.grabMouse && state.warpState == WARP_STATE_ON)
   {
-    state.sensX += ((float)rx / 10.0f) * (state.mouseSens + 10);
-    state.sensY += ((float)ry / 10.0f) * (state.mouseSens + 10);
-    rx = floor(state.sensX);
-    ry = floor(state.sensY);
-    state.sensX -= rx;
-    state.sensY -= ry;
+    const SDL_Point newPos = {
+      .x = (float)(state.cursor.x + delta.x) / state.scaleX,
+      .y = (float)(state.cursor.y + delta.y) / state.scaleY
+    };
+
+    /* check if the movement would exit the window */
+    if (newPos.x < 0 || newPos.x >= state.dstRect.w ||
+        newPos.y < 0 || newPos.y >= state.dstRect.h)
+    {
+      /* determine where to move the cursor to taking into account any borders
+       * if the aspect ratio is not being forced */
+      int nx = 0, ny = 0;
+
+      if (newPos.x < 0)
+      {
+        nx = newPos.x;
+        ny = newPos.y + state.dstRect.y;
+      }
+      else if(newPos.x >= state.dstRect.w)
+      {
+        nx = newPos.x + state.dstRect.x * 2;
+        ny = newPos.y + state.dstRect.y;
+      }
+      else if (newPos.y < 0)
+      {
+        nx = newPos.x + state.dstRect.x;
+        ny = newPos.y;
+      }
+      else if (newPos.y >= state.dstRect.h)
+      {
+        nx = newPos.x + state.dstRect.x;
+        ny = newPos.y + state.dstRect.y * 2;
+      }
+
+      if (isValidCursorLocation(
+            state.windowPos.x + state.border.x + nx,
+            state.windowPos.y + state.border.y + ny))
+      {
+        /* put the mouse where it should be and disable warp */
+        state.warpState = WARP_STATE_WIN_EXIT;
+        warpMouse(nx, ny);
+        return;
+      }
+    }
   }
 
-  if (!spice_mouse_motion(rx, ry))
+  /* send the movement to the guest */
+  if (!spice_mouse_motion(delta.x, delta.y))
     DEBUG_ERROR("failed to send mouse motion message");
-}
-
-static void alignMouseWithGuest()
-{
-  if (state.ignoreInput || !params.useSpiceInput)
-    return;
-
-  state.curLastX = (int)round((float)(state.cursor.x + state.cursor.hx) / state.scaleX) + state.dstRect.x;
-  state.curLastY = (int)round((float)(state.cursor.y + state.cursor.hy) / state.scaleY) + state.dstRect.y;
-  warpMouse(state.curLastX, state.curLastY);
 }
 
 static void alignMouseWithHost()
@@ -834,18 +950,29 @@ static void alignMouseWithHost()
   if (state.ignoreInput || !params.useSpiceInput)
     return;
 
-  if (!state.haveCursorPos || state.serverMode)
+  if (!state.haveCursorPos)
     return;
 
-  state.curLastX = (int)round((float)(state.cursor.x + state.cursor.hx) / state.scaleX) + state.dstRect.x;
-  state.curLastY = (int)round((float)(state.cursor.y + state.cursor.hy) / state.scaleY) + state.dstRect.y;
-  handleMouseMoveEvent(state.curLocalX, state.curLocalY);
+  const int dx = round((state.curLocalX - state.dstRect.x) * state.scaleX) -
+    state.cursor.x;
+
+  const int dy = round((state.curLocalY - state.dstRect.y) * state.scaleY) -
+    state.cursor.y;
+
+  spice_mouse_motion(dx, dy);
 }
 
 static void handleResizeEvent(unsigned int w, unsigned int h)
 {
   if (state.windowW == w && state.windowH == h)
     return;
+
+  SDL_GetWindowBordersSize(state.window,
+    &state.border.y,
+    &state.border.x,
+    &state.border.h,
+    &state.border.w
+  );
 
   state.windowW = w;
   state.windowH = h;
@@ -854,24 +981,63 @@ static void handleResizeEvent(unsigned int w, unsigned int h)
 
 static void handleWindowLeave()
 {
+  state.cursorInWindow = false;
+
   if (!params.useSpiceInput)
     return;
 
-  state.drawCursor   = false;
+  if (!params.alwaysShowCursor)
+    state.drawCursor = false;
+
   state.cursorInView = false;
   state.updateCursor = true;
-  state.warpState    = WARP_STATE_OFF;
 }
 
 static void handleWindowEnter()
 {
+  state.cursorInWindow = true;
+  if (state.warpState == WARP_STATE_OFF)
+    state.warpState = WARP_STATE_ON;
+
   if (!params.useSpiceInput)
+    return;
+
+  if (!state.haveCursorPos)
     return;
 
   alignMouseWithHost();
   state.drawCursor   = true;
   state.updateCursor = true;
-  state.warpState    = WARP_STATE_ARMED;
+}
+
+// only called for X11
+static void keyboardGrab()
+{
+  if (!params.grabKeyboardOnFocus)
+    return;
+
+  // grab the keyboard so we can intercept WM keys
+  XGrabKeyboard(
+    state.wminfo.info.x11.display,
+    state.wminfo.info.x11.window,
+    true,
+    GrabModeAsync,
+    GrabModeAsync,
+    CurrentTime
+  );
+}
+
+// only called for X11
+static void keyboardUngrab()
+{
+  if (!params.grabKeyboardOnFocus)
+    return;
+
+  // ungrab the keyboard
+  XUngrabKeyboard(
+    state.wminfo.info.x11.display,
+    CurrentTime
+  );
 }
 
 int eventFilter(void * userdata, SDL_Event * event)
@@ -906,6 +1072,11 @@ int eventFilter(void * userdata, SDL_Event * event)
         case SDL_WINDOWEVENT_RESIZED:
           if (state.wminfo.subsystem != SDL_SYSWM_X11)
             handleResizeEvent(event->window.data1, event->window.data2);
+          break;
+
+        case SDL_WINDOWEVENT_MOVED:
+          state.windowPos.x = event->window.data1;
+          state.windowPos.y = event->window.data2;
           break;
 
         // allow a window close event to close the application even if ignoreQuit is set
@@ -946,6 +1117,24 @@ int eventFilter(void * userdata, SDL_Event * event)
             state.curLocalY    = xe.xcrossing.y;
             state.haveCurLocal = true;
             handleWindowLeave();
+            break;
+
+          case FocusIn:
+            if (!params.useSpiceInput)
+              break;
+
+            if (xe.xfocus.mode == NotifyNormal ||
+                xe.xfocus.mode == NotifyUngrab)
+              keyboardGrab();
+            break;
+
+          case FocusOut:
+            if (!params.useSpiceInput)
+              break;
+
+            if (xe.xfocus.mode == NotifyNormal ||
+                xe.xfocus.mode == NotifyWhileGrabbed)
+              keyboardUngrab();
             break;
         }
       }
@@ -1005,19 +1194,13 @@ int eventFilter(void * userdata, SDL_Event * event)
         {
           if (params.useSpiceInput)
           {
-            state.serverMode = !state.serverMode;
-            SDL_SetWindowGrab(state.window, state.serverMode);
-            DEBUG_INFO("Server Mode: %s", state.serverMode ? "on" : "off");
+            state.grabMouse = !state.grabMouse;
+            SDL_SetWindowGrab(state.window, state.grabMouse);
 
             app_alert(
-              state.serverMode ? LG_ALERT_SUCCESS  : LG_ALERT_WARNING,
-              state.serverMode ? "Capture Enabled" : "Capture Disabled"
+              state.grabMouse ? LG_ALERT_SUCCESS  : LG_ALERT_WARNING,
+              state.grabMouse ? "Capture Enabled" : "Capture Disabled"
             );
-
-            if (state.serverMode)
-              state.warpState = WARP_STATE_ON;
-            else
-              alignMouseWithGuest();
           }
         }
         else
@@ -1067,38 +1250,38 @@ int eventFilter(void * userdata, SDL_Event * event)
       break;
 
     case SDL_MOUSEBUTTONDOWN:
+    {
       if (state.ignoreInput || !params.useSpiceInput || !state.cursorInView)
         break;
 
-      // The SPICE protocol doesn't support more than a standard PS/2 3 button mouse
-      if (event->button.button > 3)
-        break;
-      if (
-        !spice_mouse_position(event->button.x, event->button.y) ||
-        !spice_mouse_press(event->button.button)
-      )
+      int button = event->button.button;
+      if (button > 3)
+        button += 2;
+
+      if (!spice_mouse_press(button))
       {
         DEBUG_ERROR("SDL_MOUSEBUTTONDOWN: failed to send message");
         break;
       }
       break;
+    }
 
     case SDL_MOUSEBUTTONUP:
+    {
       if (state.ignoreInput || !params.useSpiceInput || !state.cursorInView)
         break;
 
-      // The SPICE protocol doesn't support more than a standard PS/2 3 button mouse
-      if (event->button.button > 3)
-        break;
-      if (
-        !spice_mouse_position(event->button.x, event->button.y) ||
-        !spice_mouse_release(event->button.button)
-      )
+      int button = event->button.button;
+      if (button > 3)
+        button += 2;
+
+      if (!spice_mouse_release(button))
       {
         DEBUG_ERROR("SDL_MOUSEBUTTONUP: failed to send message");
         break;
       }
       break;
+    }
   }
 
   // consume all events
@@ -1266,11 +1449,7 @@ static void release_key_binds()
 static int lg_run()
 {
   memset(&state, 0, sizeof(state));
-  state.state      = APP_STATE_RUNNING;
-  state.scaleX     = 1.0f;
-  state.scaleY     = 1.0f;
-  state.resizeDone = true;
-  state.drawCursor = true;
+  lgInit();
 
   state.mouseSens = params.mouseSens;
        if (state.mouseSens < -9) state.mouseSens = -9;
@@ -1391,7 +1570,6 @@ static int lg_run()
     params.h,
     (
       SDL_WINDOW_SHOWN |
-      (params.fullscreen  ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) |
       (params.allowResize ? SDL_WINDOW_RESIZABLE  : 0) |
       (params.borderless  ? SDL_WINDOW_BORDERLESS : 0) |
       (params.maximize    ? SDL_WINDOW_MAXIMIZED  : 0) |
@@ -1405,8 +1583,11 @@ static int lg_run()
     return 1;
   }
 
-  if (params.fullscreen && !params.minimizeOnFocusLoss)
-    SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
+  SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS,
+      params.minimizeOnFocusLoss ? "1" : "0");
+
+  if (params.fullscreen)
+    SDL_SetWindowFullscreen(state.window, SDL_WINDOW_FULLSCREEN_DESKTOP);
 
   if (!params.noScreensaver)
   {
@@ -1423,15 +1604,15 @@ static int lg_run()
   // ensure renderer viewport is aware of the current window size
   updatePositionInfo();
 
-  if (params.fpsMin == -1)
+  if (params.fpsMin <= 0)
   {
-      // minimum 60fps to keep interactivity decent
-      state.frameTime = 1000000000ULL / 60ULL;
+    // default 30 fps
+    state.frameTime = 1000000000ULL / 30ULL;
   }
   else
   {
-      DEBUG_INFO("Using the FPS minimum from args: %d", params.fpsMin);
-      state.frameTime = 1000000000ULL / (unsigned long long)params.fpsMin;
+    DEBUG_INFO("Using the FPS minimum from args: %d", params.fpsMin);
+    state.frameTime = 1000000000ULL / (unsigned long long)params.fpsMin;
   }
 
   register_key_binds();
@@ -1511,9 +1692,8 @@ static int lg_run()
 
   if (params.captureOnStart)
   {
-    state.serverMode = true;
-    SDL_SetWindowGrab(state.window, state.serverMode);
-    DEBUG_INFO("Server Mode: %s", state.serverMode ? "on" : "off");
+    state.grabMouse = true;
+    SDL_SetWindowGrab(state.window, true);
   }
 
   // setup the startup condition
@@ -1655,7 +1835,8 @@ restart:
     t_frame  = NULL;
     t_cursor = NULL;
 
-    state.state = APP_STATE_RUNNING;
+    lgInit();
+
     state.lgr->on_restart(state.lgrData);
 
     DEBUG_INFO("Waiting for the host to restart...");
@@ -1753,7 +1934,7 @@ int main(int argc, char * argv[])
   if (!config_load(argc, argv))
     return -1;
 
-  if (params.grabKeyboard)
+  if (params.useSpiceInput && params.grabKeyboard)
     SDL_SetHint(SDL_HINT_GRAB_KEYBOARD, "1");
 
   const int ret = lg_run();

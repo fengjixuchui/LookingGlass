@@ -44,9 +44,9 @@ struct CursorInfo
 
 enum WarpState
 {
-  WARP_STATE_ARMED,
   WARP_STATE_ON,
   WARP_STATE_ACTIVE,
+  WARP_STATE_WIN_EXIT,
   WARP_STATE_OFF
 };
 
@@ -61,18 +61,22 @@ struct AppState
   bool                 keyDown[SDL_NUM_SCANCODES];
 
   bool                 haveSrcSize;
+  SDL_Point            windowPos;
   int                  windowW, windowH;
+  SDL_Rect             border;
   SDL_Point            srcSize;
   LG_RendererRect      dstRect;
   struct CursorInfo    cursor;
   bool                 cursorVisible;
+  bool                 cursorInWindow;
 
-  bool  serverMode;
+  bool  grabMouse;
   bool  haveCursorPos;
   bool  drawCursor;
   bool  cursorInView;
   bool  updateCursor;
   bool  initialCursorSync;
+  bool  scale;
   float scaleX, scaleY;
   float accX, accY;
   int   curLastX;
@@ -83,7 +87,6 @@ struct AppState
   bool  haveAligned;
 
   enum WarpState   warpState;
-  int   warpFromX, warpFromY;
   int   warpToX  , warpToY;
 
   const LG_Renderer  * lgr;
@@ -92,6 +95,8 @@ struct AppState
 
   const LG_Clipboard * lgc;
   SpiceDataType        cbType;
+  bool                 cbChunked;
+  size_t               cbXfer;
   struct ll          * cbRequestList;
 
   SDL_SysWMinfo        wminfo;
@@ -105,7 +110,7 @@ struct AppState
   atomic_uint_least64_t frameTime;
   uint64_t              lastFrameTime;
   uint64_t              renderTime;
-  uint64_t              frameCount;
+  atomic_uint_least64_t frameCount;
   uint64_t              renderCount;
 
 
@@ -138,7 +143,7 @@ struct AppParams
   bool         center;
   int          x, y;
   unsigned int w, h;
-  unsigned int fpsMin;
+  int          fpsMin;
   bool         showFPS;
   bool         useSpiceInput;
   bool         useSpiceClipboard;
@@ -151,13 +156,16 @@ struct AppParams
   bool         ignoreQuit;
   bool         noScreensaver;
   bool         grabKeyboard;
+  bool         grabKeyboardOnFocus;
   SDL_Scancode escapeKey;
   bool         showAlerts;
   bool         captureOnStart;
   bool         quickSplash;
+  bool         alwaysShowCursor;
 
   unsigned int cursorPollInterval;
   unsigned int framePollInterval;
+  bool         allowDMA;
 
   bool         forceRenderer;
   unsigned int forceRendererIndex;
