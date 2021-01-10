@@ -48,6 +48,17 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 
 #define FADE_TIME 1000000
 
+static bool opengl_vsync_option_validator(struct Option * opt, const char ** error)
+{
+  if (opt->value.x_bool && getenv("WAYLAND_DISPLAY"))
+  {
+    DEBUG_WARN("Cannot disable vsync on Wayland, forcing opengl:vsync=off");
+    opt->value.x_bool = false;
+  }
+
+  return true;
+}
+
 static struct Option opengl_options[] =
 {
   {
@@ -62,7 +73,8 @@ static struct Option opengl_options[] =
     .name         = "vsync",
     .description  = "Enable vsync",
     .type         = OPTION_TYPE_BOOL,
-    .value.x_bool = true
+    .value.x_bool = false,
+    .validator    = &opengl_vsync_option_validator
   },
   {
     .module       = "opengl",
@@ -249,6 +261,9 @@ bool opengl_initialize(void * opaque, Uint32 * sdlFlags)
   SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER      , 1);
   SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1);
   SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, 4);
+  SDL_GL_SetAttribute(SDL_GL_RED_SIZE          , 8);
+  SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE        , 8);
+  SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE         , 8);
   return true;
 }
 

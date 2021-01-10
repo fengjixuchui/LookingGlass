@@ -97,6 +97,16 @@ struct Inst
   LG_FontObj        fontObj;
 };
 
+static bool egl_vsync_option_validator(struct Option * opt, const char ** error)
+{
+  if (opt->value.x_bool && getenv("WAYLAND_DISPLAY"))
+  {
+    DEBUG_WARN("Cannot disable vsync on Wayland, forcing egl:vsync=off");
+    opt->value.x_bool = false;
+  }
+
+  return true;
+}
 
 static struct Option egl_options[] =
 {
@@ -105,7 +115,8 @@ static struct Option egl_options[] =
     .name         = "vsync",
     .description  = "Enable vsync",
     .type         = OPTION_TYPE_BOOL,
-    .value.x_bool = false
+    .value.x_bool = false,
+    .validator    = &egl_vsync_option_validator
   },
   {
     .module       = "egl",
@@ -159,6 +170,13 @@ void egl_setup()
 
 bool egl_create(void ** opaque, const LG_RendererParams params)
 {
+  // Fail if running on Wayland so that OpenGL is used instead. Wayland-EGL
+  // is broken (https://github.com/gnif/LookingGlass/issues/306) and isn't
+  // fixable until SDL is dropped entirely. Until then, the OpenGL renderer
+  // "mostly works".
+  if (getenv("WAYLAND_DISPLAY"))
+    return false;
+
   // check if EGL is even available
   if (!eglQueryString(EGL_NO_DISPLAY, EGL_VERSION))
     return false;
@@ -547,16 +565,30 @@ bool egl_render_startup(void * opaque, SDL_Window * window)
 
   eglMakeCurrent(this->display, this->surface, this->surface, this->context);
   const char *client_exts = eglQueryString(this->display, EGL_EXTENSIONS);
+  const char *vendor      = (const char *)glGetString(GL_VENDOR);
 
   DEBUG_INFO("EGL       : %d.%d", maj, min);
-  DEBUG_INFO("Vendor    : %s", glGetString(GL_VENDOR  ));
+  DEBUG_INFO("Vendor    : %s", vendor);
   DEBUG_INFO("Renderer  : %s", glGetString(GL_RENDERER));
   DEBUG_INFO("Version   : %s", glGetString(GL_VERSION ));
   DEBUG_INFO("EGL APIs  : %s", eglQueryString(this->display, EGL_CLIENT_APIS));
   DEBUG_INFO("Extensions: %s", client_exts);
 
   if (strstr(client_exts, "EGL_EXT_image_dma_buf_import") != NULL)
-    this->dmaSupport = true;
+  {
+    /*
+     * As of version 455.45.01 NVidia started advertising support for this
+     * feature, however even on the latest version 460.27.04 this is still
+     * broken and does not work, until this is fixed and we have way to detect
+     * this early just disable dma for all NVIDIA devices.
+     *
+     * ref: https://forums.developer.nvidia.com/t/egl-ext-image-dma-buf-import-broken-egl-bad-alloc-with-tons-of-free-ram/165552
+     */
+    if (strstr(vendor, "NVIDIA") != NULL)
+      DEBUG_WARN("NVIDIA driver detected, ignoring broken DMA support");
+    else
+      this->dmaSupport = true;
+  }
 
   eglSwapInterval(this->display, this->opt.vsync ? 1 : 0);
 

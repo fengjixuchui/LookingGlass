@@ -24,6 +24,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "common/option.h"
 #include "common/locking.h"
 #include "common/event.h"
+#include "common/dpi.h"
 
 #include <assert.h>
 #include <stdatomic.h>
@@ -98,12 +99,12 @@ struct iface
   unsigned int  pitch;
   unsigned int  stride;
   CaptureFormat format;
+  unsigned int  dpi;
 
   int  lastPointerX, lastPointerY;
   bool lastPointerVisible;
 };
 
-static bool           dpiDone = false;
 static struct iface * this    = NULL;
 
 // forwards
@@ -208,22 +209,6 @@ static bool dxgi_init()
     DEBUG_INFO("This is not a failure, please do not report this as an issue.");
     DEBUG_INFO("To fix this, install and run the Looking Glass host as a service.");
     DEBUG_INFO("looking-glass-host.exe InstallService");
-  }
-
-  // this is required for DXGI 1.5 support to function
-  if (!dpiDone)
-  {
-    DECLARE_HANDLE(DPI_AWARENESS_CONTEXT);
-    #define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2  ((DPI_AWARENESS_CONTEXT)-4)
-    typedef BOOL (*User32_SetProcessDpiAwarenessContext)(DPI_AWARENESS_CONTEXT value);
-
-    HMODULE user32 = LoadLibraryA("user32.dll");
-    User32_SetProcessDpiAwarenessContext fn;
-    fn = (User32_SetProcessDpiAwarenessContext)GetProcAddress(user32, "SetProcessDpiAwarenessContext");
-    if (fn)
-      fn(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    FreeLibrary(user32);
-    dpiDone = true;
   }
 
   HRESULT          status;
@@ -388,6 +373,7 @@ static bool dxgi_init()
   IDXGIAdapter1_GetDesc1(this->adapter, &adapterDesc);
   this->width  = outputDesc.DesktopCoordinates.right  - outputDesc.DesktopCoordinates.left;
   this->height = outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top;
+  this->dpi    = monitor_dpi(outputDesc.Monitor);
   ++this->formatVer;
 
   DEBUG_INFO("Device Descripion: %ls"    , adapterDesc.Description);
@@ -688,6 +674,14 @@ static unsigned int dxgi_getMaxFrameSize()
   return this->height * this->pitch;
 }
 
+static unsigned int dxgi_getMouseScale()
+{
+  assert(this);
+  assert(this->initialized);
+
+  return this->dpi * 100 / DPI_100_PERCENT;
+}
+
 static CaptureResult dxgi_hResultToCaptureResult(const HRESULT status)
 {
   switch(status)
@@ -841,26 +835,12 @@ static CaptureResult dxgi_capture()
           return CAPTURE_RESULT_ERROR;
       }
 
-      CURSORINFO ci = { .cbSize = sizeof(CURSORINFO) };
-      ICONINFO ii;
-      if (GetCursorInfo(&ci) && ci.hCursor && GetIconInfo(ci.hCursor, &ii))
-      {
-        DeleteObject(ii.hbmMask);
-        DeleteObject(ii.hbmColor);
-
-        pointer.hx = ii.xHotspot;
-        pointer.hy = ii.yHotspot;
-      }
-      else
-      {
-        pointer.hx = 0;
-        pointer.hy = 0;
-      }
-
       pointer.shapeUpdate = true;
       pointer.width       = shapeInfo.Width;
       pointer.height      = shapeInfo.Height;
       pointer.pitch       = shapeInfo.Pitch;
+      pointer.hx          = shapeInfo.HotSpot.x;
+      pointer.hy          = shapeInfo.HotSpot.y;
       postPointer         = true;
     }
   }
@@ -1013,6 +993,7 @@ struct CaptureInterface Capture_DXGI =
   .deinit          = dxgi_deinit,
   .free            = dxgi_free,
   .getMaxFrameSize = dxgi_getMaxFrameSize,
+  .getMouseScale   = dxgi_getMouseScale,
   .capture         = dxgi_capture,
   .waitFrame       = dxgi_waitFrame,
   .getFrame        = dxgi_getFrame

@@ -1,6 +1,6 @@
 /*
-KVMGFX Client - A KVM Client for VGA Passthrough
-Copyright (C) 2017-2019 Geoffrey McRae <geoff@hostfission.com>
+Looking Glass - KVM FrameRelay (KVMFR) Client
+Copyright (C) 2017-2020 Geoffrey McRae <geoff@hostfission.com>
 https://looking-glass.hostfission.com
 
 This program is free software; you can redistribute it and/or modify it under
@@ -17,16 +17,9 @@ this program; if not, write to the Free Software Foundation, Inc., 59 Temple
 Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
-#include <stdbool.h>
-struct ll;
+#include <windows.h>
 
-struct ll *  ll_new();
-void         ll_free     (struct ll * list);
-void         ll_push     (struct ll * list, void * data);
-bool         ll_shift    (struct ll * list, void ** data);
-bool         ll_peek_head(struct ll * list, void ** data);
-bool         ll_peek_tail(struct ll * list, void ** data);
-unsigned int ll_count    (struct ll * list);
+// At 100% scaling, Windows reports 96 DPI.
+#define DPI_100_PERCENT 96
 
-void         ll_reset    (struct ll * list);
-bool         ll_walk     (struct ll * list, void ** data);
+UINT monitor_dpi(HMONITOR hMonitor);

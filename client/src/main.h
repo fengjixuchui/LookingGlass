@@ -50,13 +50,14 @@ struct AppState
   SDL_Point            windowPos;
   int                  windowW, windowH;
   int                  windowCX, windowCY;
+  bool                 focused;
   SDL_Rect             border;
   SDL_Point            srcSize;
   LG_RendererRect      dstRect;
 
   const LG_Renderer  * lgr;
   void               * lgrData;
-  bool                 lgrResize;
+  atomic_int           lgrResize;
 
   const LG_Clipboard * lgc;
   SpiceDataType        cbType;
@@ -89,6 +90,7 @@ struct AppState
   KeybindHandle kbMouseSensInc;
   KeybindHandle kbMouseSensDec;
   KeybindHandle kbCtrlAltFn[12];
+  KeybindHandle kbPass[2];
 };
 
 struct AppParams
@@ -120,6 +122,7 @@ struct AppParams
   bool         grabKeyboard;
   bool         grabKeyboardOnFocus;
   SDL_Scancode escapeKey;
+  bool         ignoreWindowsKeys;
   bool         showAlerts;
   bool         captureOnStart;
   bool         quickSplash;
@@ -135,6 +138,10 @@ struct AppParams
   const char * windowTitle;
   bool         mouseRedraw;
   int          mouseSens;
+  bool         mouseSmoothing;
+  bool         rawMouse;
+  bool         autoCapture;
+  bool         captureInputOnly;
 };
 
 struct CBRequest
@@ -154,8 +161,6 @@ struct KeybindHandle
 enum WarpState
 {
   WARP_STATE_ON,
-  WARP_STATE_ACTIVE,
-  WARP_STATE_WIN_EXIT,
   WARP_STATE_OFF
 };
 
@@ -172,44 +177,56 @@ struct CursorInfo
 
   /* true if the details in this struct are valid */
   bool valid;
+
+  /* the DPI scaling of the guest */
+  uint32_t dpiScale;
+};
+
+struct DoublePoint
+{
+  double x, y;
 };
 
 struct CursorState
 {
   /* cursor is in grab mode */
-  bool  grab;
+  bool grab;
 
   /* true if we are to draw the cursor on screen */
-  bool  draw;
+  bool draw;
 
   /* true if the cursor is currently in our window */
-  bool  inWindow;
+  bool inWindow;
 
   /* true if the cursor is currently in the guest view area */
-  bool  inView;
+  bool inView;
 
   /* true if the cursor needs re-drawing/updating */
-  bool  redraw;
+  bool redraw;
 
   /* true if the cursor movements should be scaled */
-  bool  scale;
+  bool useScale;
 
   /* the amount to scale the X & Y movements by */
-  float scaleX, scaleY;
+  struct DoublePoint scale;
 
-  /* the error accumulators */
-  float accX, accY;
+  /* the dpi scale factor from the guest as a fraction */
+  double dpiScale;
 
-  /* the last local X & Y positions */
-  SDL_Point last;
+  /* the error accumulator */
+  struct DoublePoint acc;
 
-  /* the scale factors for the mouse sensitiviy */
-  int   sens;
-  float sensX, sensY;
+  /* the local position */
+  struct DoublePoint pos;
 
-  /* the mouse warp state and target */
+  /* the delta since last warp when in auto capture mode */
+  struct DoublePoint delta;
+
+  /* the scale factor for the mouse sensitiviy */
+  int sens;
+
+  /* the mouse warp state */
   enum WarpState warpState;
-  SDL_Point warpTo;
 
   /* the guest's cursor position */
   struct CursorInfo guest;
