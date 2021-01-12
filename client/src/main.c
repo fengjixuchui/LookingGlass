@@ -88,7 +88,7 @@ struct AppParams params = { 0 };
 static void setGrab(bool enable);
 static void setGrabQuiet(bool enable);
 
-static void handleMouseGrabbed(double ex, double ey);
+void handleMouseGrabbed(double ex, double ey);
 static void handleMouseNormal(double ex, double ey);
 
 static void lgInit()
@@ -874,15 +874,16 @@ static void cursorToInt(double ex, double ey, int *x, int *y)
   }
 
   /* convert to int accumulating the fractional error */
-  g_cursor.acc.x += ex;
-  g_cursor.acc.y += ey;
-  *x = floor(g_cursor.acc.x);
-  *y = floor(g_cursor.acc.y);
-  g_cursor.acc.x -= *x;
-  g_cursor.acc.y -= *y;
+  ex += g_cursor.acc.x;
+  ey += g_cursor.acc.y;
+  g_cursor.acc.x = modf(ex, &ex);
+  g_cursor.acc.y = modf(ey, &ey);
+
+  *x = (int)ex;
+  *y = (int)ey;
 }
 
-static void handleMouseGrabbed(double ex, double ey)
+void handleMouseGrabbed(double ex, double ey)
 {
   int x, y;
 
@@ -913,6 +914,25 @@ static void guestCurToLocal(struct DoublePoint *local)
   local->y = (g_cursor.guest.y + g_cursor.guest.hy) / g_cursor.scale.y;
 }
 
+// On Wayland, our normal cursor logic does not work due to the lack of cursor
+// warp support. Instead, we attempt a best-effort emulation which works with a
+// 1:1 mouse movement patch applied in the guest. For anything fancy, use
+// capture mode.
+static void handleMouseWayland()
+{
+  double ex = (g_cursor.pos.x - g_cursor.guest.x) / g_cursor.dpiScale;
+  double ey = (g_cursor.pos.y - g_cursor.guest.y) / g_cursor.dpiScale;
+
+  int x, y;
+  cursorToInt(ex, ey, &x, &y);
+
+  g_cursor.guest.x += x;
+  g_cursor.guest.y += y;
+
+  if (!spice_mouse_motion(x, y))
+    DEBUG_ERROR("failed to send mouse motion message");
+}
+
 static void handleMouseNormal(double ex, double ey)
 {
   /* if we don't have the current cursor pos just send cursor movements */
@@ -920,6 +940,12 @@ static void handleMouseNormal(double ex, double ey)
   {
     if (g_cursor.grab)
       handleMouseGrabbed(ex, ey);
+    return;
+  }
+
+  if (g_state.wminfo.subsystem == SDL_SYSWM_WAYLAND)
+  {
+    handleMouseWayland();
     return;
   }
 
@@ -1133,6 +1159,8 @@ static void setGrabQuiet(bool enable)
     return;
 
   g_cursor.grab = enable;
+  g_cursor.acc.x = 0.0;
+  g_cursor.acc.y = 0.0;
 
   if (enable)
   {
@@ -1197,13 +1225,41 @@ int eventFilter(void * userdata, SDL_Event * event)
       switch(event->window.event)
       {
         case SDL_WINDOWEVENT_ENTER:
+          if (g_state.wminfo.subsystem == SDL_SYSWM_WAYLAND)
+            g_cursor.inView = true;
           if (g_state.wminfo.subsystem != SDL_SYSWM_X11)
             handleWindowEnter();
           break;
 
         case SDL_WINDOWEVENT_LEAVE:
+          if (g_state.wminfo.subsystem == SDL_SYSWM_WAYLAND)
+            g_cursor.inView = false;
           if (g_state.wminfo.subsystem != SDL_SYSWM_X11)
             handleWindowLeave();
+          break;
+
+        case SDL_WINDOWEVENT_FOCUS_GAINED:
+          if (g_state.wminfo.subsystem != SDL_SYSWM_X11)
+          {
+            g_state.focused = true;
+
+            if (!inputEnabled())
+              break;
+            if (params.grabKeyboardOnFocus)
+              wmGrabKeyboard();
+          }
+          break;
+
+        case SDL_WINDOWEVENT_FOCUS_LOST:
+          if (g_state.wminfo.subsystem != SDL_SYSWM_X11)
+          {
+            g_state.focused = false;
+
+            if (!inputEnabled())
+              break;
+            if (params.grabKeyboardOnFocus)
+              wmUngrabKeyboard();
+          }
           break;
 
         case SDL_WINDOWEVENT_SIZE_CHANGED:
@@ -1423,8 +1479,16 @@ int eventFilter(void * userdata, SDL_Event * event)
       if (g_state.wminfo.subsystem == SDL_SYSWM_X11)
         break;
 
+      g_cursor.pos.x = event->motion.x;
+      g_cursor.pos.y = event->motion.y;
+
       if (g_cursor.grab)
-        handleMouseGrabbed(event->motion.xrel, event->motion.yrel);
+      {
+        // On Wayland, wm.c calls handleMouseGrabbed, bypassing the SDL event
+        // loop.
+        if (g_state.wminfo.subsystem != SDL_SYSWM_WAYLAND)
+          handleMouseGrabbed(event->motion.xrel, event->motion.yrel);
+      }
       else
         handleMouseNormal(event->motion.xrel, event->motion.yrel);
       break;
@@ -2001,6 +2065,8 @@ static int lg_run()
   // the end of the output
   lgWaitEvent(e_startup, TIMEOUT_INFINITE);
 
+  wmInit();
+
   LGMP_STATUS status;
 
   while(g_state.state == APP_STATE_RUNNING)
@@ -2192,7 +2258,10 @@ static void lg_shutdown()
   }
 
   if (g_state.window)
+  {
+    wmFree();
     SDL_DestroyWindow(g_state.window);
+  }
 
   if (cursor)
     SDL_FreeCursor(cursor);
@@ -2227,9 +2296,6 @@ int main(int argc, char * argv[])
 
   if (!config_load(argc, argv))
     return -1;
-
-  if (params.useSpiceInput && params.grabKeyboard)
-    SDL_SetHint(SDL_HINT_GRAB_KEYBOARD, "1");
 
   const int ret = lg_run();
   lg_shutdown();
