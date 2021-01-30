@@ -196,12 +196,12 @@ static bool draw_frame(struct Inst * this);
 static void draw_mouse(struct Inst * this);
 static void render_wait(struct Inst * this);
 
-const char * opengl_get_name()
+const char * opengl_get_name(void)
 {
   return "OpenGL";
 }
 
-static void opengl_setup()
+static void opengl_setup(void)
 {
   option_register(opengl_options);
 }
@@ -316,7 +316,8 @@ void opengl_on_restart(void * opaque)
   this->waiting = true;
 }
 
-void opengl_on_resize(void * opaque, const int width, const int height, const LG_RendererRect destRect)
+void opengl_on_resize(void * opaque, const int width, const int height,
+    const LG_RendererRect destRect, LG_RendererRotate rotate)
 {
   struct Inst * this = (struct Inst *)opaque;
 
@@ -346,7 +347,8 @@ void opengl_on_resize(void * opaque, const int width, const int height, const LG
   }
 }
 
-bool opengl_on_mouse_shape(void * opaque, const LG_RendererCursor cursor, const int width, const int height, const int pitch, const uint8_t * data)
+bool opengl_on_mouse_shape(void * opaque, const LG_RendererCursor cursor,
+    const int width, const int height, const int pitch, const uint8_t * data)
 {
   struct Inst * this = (struct Inst *)opaque;
   if (!this)
@@ -562,7 +564,7 @@ bool opengl_render_startup(void * opaque, SDL_Window * window)
   return true;
 }
 
-bool opengl_render(void * opaque, SDL_Window * window)
+bool opengl_render(void * opaque, SDL_Window * window, LG_RendererRotate rotate)
 {
   struct Inst * this = (struct Inst *)opaque;
   if (!this)
@@ -1109,7 +1111,6 @@ static void update_mouse_shape(struct Inst * this, bool * newShape)
   switch(cursor)
   {
     case LG_CURSOR_MASKED_COLOR:
-    {
       for(int i = 0; i < width * height; ++i)
       {
         const uint32_t c = ((uint32_t *)data)[i];
@@ -1120,7 +1121,6 @@ static void update_mouse_shape(struct Inst * this, bool * newShape)
       //
       // technically we should also create an XOR texture from the data but this
       // usage seems very rare in modern software.
-    }
 
     case LG_CURSOR_COLOR:
     {

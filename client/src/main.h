@@ -20,10 +20,11 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <SDL2/SDL.h>
+#include <linux/input.h>
 
 #include "interface/app.h"
+#include "dynamic/displayservers.h"
 #include "dynamic/renderers.h"
-#include "dynamic/clipboards.h"
 #include "common/ivshmem.h"
 
 #include "spice/spice.h"
@@ -38,28 +39,34 @@ enum RunState
 
 struct AppState
 {
-  enum RunState        state;
+  enum RunState state;
+
+  struct LG_DisplayServerOps * ds;
+
   bool                 stopVideo;
   bool                 ignoreInput;
   bool                 escapeActive;
   SDL_Scancode         escapeAction;
-  KeybindHandle        bindings[SDL_NUM_SCANCODES];
-  bool                 keyDown[SDL_NUM_SCANCODES];
+  KeybindHandle        bindings[KEY_MAX];
+  bool                 keyDown[KEY_MAX];
 
   bool                 haveSrcSize;
   SDL_Point            windowPos;
   int                  windowW, windowH;
   int                  windowCX, windowCY;
+  LG_RendererRotate    rotate;
   bool                 focused;
   SDL_Rect             border;
   SDL_Point            srcSize;
   LG_RendererRect      dstRect;
+  bool                 posInfoValid;
+  bool                 alignToGuest;
 
   const LG_Renderer  * lgr;
   void               * lgrData;
   atomic_int           lgrResize;
 
-  const LG_Clipboard * lgc;
+  bool                 cbAvailable;
   SpiceDataType        cbType;
   bool                 cbChunked;
   size_t               cbXfer;
@@ -73,6 +80,7 @@ struct AppState
   PLGMPClientQueue     frameQueue;
   PLGMPClientQueue     pointerQueue;
 
+  bool                  formatValid;
   atomic_uint_least64_t frameTime;
   uint64_t              lastFrameTime;
   uint64_t              renderTime;
@@ -85,6 +93,7 @@ struct AppState
 
   KeybindHandle kbFS;
   KeybindHandle kbVideo;
+  KeybindHandle kbRotate;
   KeybindHandle kbInput;
   KeybindHandle kbQuit;
   KeybindHandle kbMouseSensInc;
@@ -95,53 +104,54 @@ struct AppState
 
 struct AppParams
 {
-  bool         autoResize;
-  bool         allowResize;
-  bool         keepAspect;
-  bool         forceAspect;
-  bool         dontUpscale;
-  bool         borderless;
-  bool         fullscreen;
-  bool         maximize;
-  bool         minimizeOnFocusLoss;
-  bool         center;
-  int          x, y;
-  unsigned int w, h;
-  int          fpsMin;
-  bool         showFPS;
-  bool         useSpiceInput;
-  bool         useSpiceClipboard;
-  const char * spiceHost;
-  unsigned int spicePort;
-  bool         clipboardToVM;
-  bool         clipboardToLocal;
-  bool         scaleMouseInput;
-  bool         hideMouse;
-  bool         ignoreQuit;
-  bool         noScreensaver;
-  bool         grabKeyboard;
-  bool         grabKeyboardOnFocus;
-  SDL_Scancode escapeKey;
-  bool         ignoreWindowsKeys;
-  bool         showAlerts;
-  bool         captureOnStart;
-  bool         quickSplash;
-  bool         alwaysShowCursor;
+  bool              autoResize;
+  bool              allowResize;
+  bool              keepAspect;
+  bool              forceAspect;
+  bool              dontUpscale;
+  bool              borderless;
+  bool              fullscreen;
+  bool              maximize;
+  bool              minimizeOnFocusLoss;
+  bool              center;
+  int               x, y;
+  unsigned int      w, h;
+  int               fpsMin;
+  bool              showFPS;
+  LG_RendererRotate winRotate;
+  bool              useSpiceInput;
+  bool              useSpiceClipboard;
+  const char *      spiceHost;
+  unsigned int      spicePort;
+  bool              clipboardToVM;
+  bool              clipboardToLocal;
+  bool              scaleMouseInput;
+  bool              hideMouse;
+  bool              ignoreQuit;
+  bool              noScreensaver;
+  bool              grabKeyboard;
+  bool              grabKeyboardOnFocus;
+  SDL_Scancode      escapeKey;
+  bool              ignoreWindowsKeys;
+  bool              showAlerts;
+  bool              captureOnStart;
+  bool              quickSplash;
+  bool              alwaysShowCursor;
 
-  unsigned int cursorPollInterval;
-  unsigned int framePollInterval;
-  bool         allowDMA;
+  unsigned int      cursorPollInterval;
+  unsigned int      framePollInterval;
+  bool              allowDMA;
 
-  bool         forceRenderer;
-  unsigned int forceRendererIndex;
+  bool              forceRenderer;
+  unsigned int      forceRendererIndex;
 
-  const char * windowTitle;
-  bool         mouseRedraw;
-  int          mouseSens;
-  bool         mouseSmoothing;
-  bool         rawMouse;
-  bool         autoCapture;
-  bool         captureInputOnly;
+  const char *      windowTitle;
+  bool              mouseRedraw;
+  int               mouseSens;
+  bool              mouseSmoothing;
+  bool              rawMouse;
+  bool              autoCapture;
+  bool              captureInputOnly;
 };
 
 struct CBRequest
@@ -201,6 +211,9 @@ struct CursorState
   /* true if the cursor is currently in the guest view area */
   bool inView;
 
+  /* true if the guest should be realigned to the host when next drawn */
+  bool realign;
+
   /* true if the cursor needs re-drawing/updating */
   bool redraw;
 
@@ -219,6 +232,12 @@ struct CursorState
   /* the local position */
   struct DoublePoint pos;
 
+  /* true if the position is valid */
+  bool valid;
+
+  /* the button state */
+  unsigned int buttons;
+
   /* the delta since last warp when in auto capture mode */
   struct DoublePoint delta;
 
@@ -235,5 +254,3 @@ struct CursorState
 // forwards
 extern struct AppState  g_state;
 extern struct AppParams params;
-
-void handleMouseGrabbed(double, double);

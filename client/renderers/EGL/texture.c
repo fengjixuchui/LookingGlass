@@ -20,14 +20,25 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "texture.h"
 #include "common/debug.h"
 #include "common/framebuffer.h"
-#include "debug.h"
+#include "dynprocs.h"
 #include "utils.h"
+#include "egldebug.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdatomic.h>
-#include <libdrm/drm_fourcc.h>
+
+/**
+ * the following comes from drm_fourcc.h and is included here to avoid the
+ * external dependency for the few simple defines we need
+ */
+#define fourcc_code(a, b, c, d) ((uint32_t)(a) | ((uint32_t)(b) << 8) | \
+         ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
+#define DRM_FORMAT_ARGB8888      fourcc_code('A', 'R', '2', '4')
+#define DRM_FORMAT_ABGR8888      fourcc_code('A', 'B', '2', '4')
+#define DRM_FORMAT_BGRA1010102   fourcc_code('B', 'A', '3', '0')
+#define DRM_FORMAT_ABGR16161616F fourcc_code('A', 'B', '4', 'H')
 
 #include <SDL2/SDL_egl.h>
 
@@ -131,7 +142,8 @@ static bool egl_texture_map(EGL_Texture * texture, uint8_t i)
 
   if (!texture->buf[i].map)
   {
-    EGL_ERROR("glMapBufferRange failed for %d of %lu bytes", i, texture->pboBufferSize);
+    DEBUG_EGL_ERROR("glMapBufferRange failed for %d of %lu bytes", i,
+        texture->pboBufferSize);
     return false;
   }
 
@@ -268,7 +280,7 @@ bool egl_texture_setup(EGL_Texture * texture, enum EGL_PixelFormat pixFmt, size_
   return true;
 }
 
-static void egl_warn_slow()
+static void egl_warn_slow(void)
 {
   static bool warnDone = false;
   if (!warnDone)
@@ -376,13 +388,13 @@ bool egl_texture_update_from_dma(EGL_Texture * texture, const FrameBuffer * fram
 
   if (image == EGL_NO_IMAGE)
   {
-    DEBUG_ERROR("failed to create ELGImage for DMA transfer");
+    DEBUG_EGL_ERROR("Failed to create ELGImage for DMA transfer");
     return false;
   }
 
   /* bind the texture and initiate the transfer */
   glBindTexture(GL_TEXTURE_2D, texture->tex);
-  glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
+  g_dynprocs.glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
 
   /* wait for completion */
   framebuffer_wait(frame, texture->height * texture->stride);
@@ -470,7 +482,7 @@ enum EGL_TexStatus egl_texture_bind(EGL_Texture * texture)
         case GL_INVALID_VALUE:
           glDeleteSync(texture->buf[b].sync);
           texture->buf[b].sync = 0;
-          EGL_ERROR("glClientWaitSync failed");
+          DEBUG_EGL_ERROR("glClientWaitSync failed");
           return EGL_TEX_STATUS_ERROR;
       }
     }

@@ -93,13 +93,14 @@ struct iface
   CapturePostPointerBuffer   postPointerBufferFn;
   LGEvent                  * frameEvent;
 
-  unsigned int  formatVer;
-  unsigned int  width;
-  unsigned int  height;
-  unsigned int  pitch;
-  unsigned int  stride;
-  CaptureFormat format;
-  unsigned int  dpi;
+  unsigned int    formatVer;
+  unsigned int    width;
+  unsigned int    height;
+  unsigned int    pitch;
+  unsigned int    stride;
+  CaptureFormat   format;
+  CaptureRotation rotation;
+  unsigned int    dpi;
 
   int  lastPointerX, lastPointerY;
   bool lastPointerVisible;
@@ -114,12 +115,12 @@ static CaptureResult dxgi_releaseFrame();
 
 // implementation
 
-static const char * dxgi_getName()
+static const char * dxgi_getName(void)
 {
   return "DXGI";
 }
 
-static void dxgi_initOptions()
+static void dxgi_initOptions(void)
 {
   struct Option options[] =
   {
@@ -186,7 +187,7 @@ static bool dxgi_create(CaptureGetPointerBuffer getPointerBufferFn, CapturePostP
   return true;
 }
 
-static bool dxgi_init()
+static bool dxgi_init(void)
 {
   assert(this);
 
@@ -371,9 +372,45 @@ static bool dxgi_init()
 
   DXGI_ADAPTER_DESC1 adapterDesc;
   IDXGIAdapter1_GetDesc1(this->adapter, &adapterDesc);
-  this->width  = outputDesc.DesktopCoordinates.right  - outputDesc.DesktopCoordinates.left;
-  this->height = outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top;
-  this->dpi    = monitor_dpi(outputDesc.Monitor);
+
+  switch(outputDesc.Rotation)
+  {
+    case DXGI_MODE_ROTATION_ROTATE90:
+    case DXGI_MODE_ROTATION_ROTATE270:
+      this->width    = outputDesc.DesktopCoordinates.bottom -
+                       outputDesc.DesktopCoordinates.top;
+      this->height   = outputDesc.DesktopCoordinates.right -
+                       outputDesc.DesktopCoordinates.left;
+      break;
+
+    default:
+      this->width    = outputDesc.DesktopCoordinates.right  -
+                       outputDesc.DesktopCoordinates.left;
+      this->height   = outputDesc.DesktopCoordinates.bottom -
+                       outputDesc.DesktopCoordinates.top;
+      break;
+  }
+
+  switch(outputDesc.Rotation)
+  {
+    case DXGI_MODE_ROTATION_ROTATE90:
+      this->rotation = CAPTURE_ROT_270;
+      break;
+
+    case DXGI_MODE_ROTATION_ROTATE180:
+      this->rotation = CAPTURE_ROT_180;
+      break;
+
+    case DXGI_MODE_ROTATION_ROTATE270:
+      this->rotation = CAPTURE_ROT_90;
+      break;
+
+    default:
+      this->rotation = CAPTURE_ROT_0;
+      break;
+  }
+
+  this->dpi = monitor_dpi(outputDesc.Monitor);
   ++this->formatVer;
 
   DEBUG_INFO("Device Descripion: %ls"    , adapterDesc.Description);
@@ -572,12 +609,12 @@ fail:
   return false;
 }
 
-static void dxgi_stop()
+static void dxgi_stop(void)
 {
   this->stop = true;
 }
 
-static bool dxgi_deinit()
+static bool dxgi_deinit(void)
 {
   assert(this);
 
@@ -653,7 +690,7 @@ static bool dxgi_deinit()
   return true;
 }
 
-static void dxgi_free()
+static void dxgi_free(void)
 {
   assert(this);
 
@@ -666,7 +703,7 @@ static void dxgi_free()
   this = NULL;
 }
 
-static unsigned int dxgi_getMaxFrameSize()
+static unsigned int dxgi_getMaxFrameSize(void)
 {
   assert(this);
   assert(this->initialized);
@@ -674,7 +711,7 @@ static unsigned int dxgi_getMaxFrameSize()
   return this->height * this->pitch;
 }
 
-static unsigned int dxgi_getMouseScale()
+static unsigned int dxgi_getMouseScale(void)
 {
   assert(this);
   assert(this->initialized);
@@ -701,12 +738,12 @@ static CaptureResult dxgi_hResultToCaptureResult(const HRESULT status)
   }
 }
 
-static CaptureResult dxgi_capture()
+static CaptureResult dxgi_capture(void)
 {
   assert(this);
   assert(this->initialized);
 
-  Texture                 * tex;
+  Texture                 * tex = NULL;
   CaptureResult             result;
   HRESULT                   status;
   DXGI_OUTDUPL_FRAME_INFO   frameInfo;
@@ -928,6 +965,7 @@ static CaptureResult dxgi_waitFrame(CaptureFrame * frame)
   frame->pitch     = this->pitch;
   frame->stride    = this->stride;
   frame->format    = this->format;
+  frame->rotation  = this->rotation;
 
   atomic_fetch_sub_explicit(&this->texReady, 1, memory_order_release);
   return CAPTURE_RESULT_OK;
@@ -950,7 +988,7 @@ static CaptureResult dxgi_getFrame(FrameBuffer * frame)
   return CAPTURE_RESULT_OK;
 }
 
-static CaptureResult dxgi_releaseFrame()
+static CaptureResult dxgi_releaseFrame(void)
 {
   assert(this);
   if (!this->needsRelease)

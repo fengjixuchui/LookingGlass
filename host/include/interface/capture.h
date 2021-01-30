@@ -39,7 +39,6 @@ typedef enum CaptureFormat
   CAPTURE_FMT_RGBA   ,
   CAPTURE_FMT_RGBA10 ,
   CAPTURE_FMT_RGBA16F,
-  CAPTURE_FMT_YUV420 ,
 
   // pointer formats
   CAPTURE_FMT_COLOR ,
@@ -50,14 +49,24 @@ typedef enum CaptureFormat
 }
 CaptureFormat;
 
+typedef enum CaptureRotation
+{
+  CAPTURE_ROT_0,
+  CAPTURE_ROT_90,
+  CAPTURE_ROT_180,
+  CAPTURE_ROT_270
+}
+CaptureRotation;
+
 typedef struct CaptureFrame
 {
-  unsigned int   formatVer;
-  unsigned int   width;
-  unsigned int   height;
-  unsigned int   pitch;
-  unsigned int   stride;
-  CaptureFormat  format;
+  unsigned int    formatVer;
+  unsigned int    width;
+  unsigned int    height;
+  unsigned int    pitch;
+  unsigned int    stride;
+  CaptureFormat   format;
+  CaptureRotation rotation;
 }
 CaptureFrame;
 

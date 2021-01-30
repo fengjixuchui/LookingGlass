@@ -35,10 +35,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <stdbool.h>
 #include <assert.h>
 #include <stdatomic.h>
-
-#if SDL_VIDEO_DRIVER_X11_XINPUT2
-#include <X11/extensions/XInput2.h>
-#endif
+#include <linux/input.h>
 
 #include "common/debug.h"
 #include "common/crash.h"
@@ -51,10 +48,10 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "common/time.h"
 #include "common/version.h"
 
+#include "app.h"
 #include "utils.h"
 #include "kb.h"
 #include "ll.h"
-#include "wm.h"
 
 #define RESIZE_TIMEOUT (10 * 1000) // 10ms
 
@@ -71,7 +68,6 @@ static LGThread *t_cursor  = NULL;
 static LGThread *t_frame   = NULL;
 static SDL_Cursor *cursor  = NULL;
 
-static int    g_XInputOp; // XInput Opcode
 static Uint32 e_SDLEvent; // our SDL event
 
 enum
@@ -87,30 +83,92 @@ struct AppParams params = { 0 };
 
 static void setGrab(bool enable);
 static void setGrabQuiet(bool enable);
+static void setCursorInView(bool enable);
 
-void handleMouseGrabbed(double ex, double ey);
-static void handleMouseNormal(double ex, double ey);
-
-static void lgInit()
+static void lgInit(void)
 {
   g_state.state         = APP_STATE_RUNNING;
+  g_state.formatValid   = false;
   g_state.resizeDone    = true;
+
+  if (g_cursor.grab)
+    setGrab(false);
 
   g_cursor.useScale      = false;
   g_cursor.scale.x       = 1.0;
   g_cursor.scale.y       = 1.0;
-  g_cursor.draw          = true;
+  g_cursor.draw          = false;
   g_cursor.inView        = false;
   g_cursor.guest.valid   = false;
+
+  // if spice is not in use, hide the local cursor
+  if (!app_inputEnabled() && params.hideMouse)
+    SDL_ShowCursor(SDL_DISABLE);
+  else
+    SDL_ShowCursor(SDL_ENABLE);
 }
 
-static bool inputEnabled()
+bool app_getProp(LG_DSProperty prop, void * ret)
+{
+  return g_state.ds->getProp(prop, ret);
+}
+
+SDL_Window * app_getWindow(void)
+{
+  return g_state.window;
+}
+
+bool app_inputEnabled(void)
 {
   return params.useSpiceInput && !g_state.ignoreInput &&
     ((g_cursor.grab && params.captureInputOnly) || !params.captureInputOnly);
 }
 
-static void alignToGuest()
+bool app_cursorInWindow(void)
+{
+  return g_cursor.inWindow;
+}
+
+bool app_cursorIsGrabbed(void)
+{
+  return g_cursor.grab;
+}
+
+bool app_cursorWantsRaw(void)
+{
+  return params.rawMouse;
+}
+
+void app_updateCursorPos(double x, double y)
+{
+  g_cursor.pos.x = x;
+  g_cursor.pos.y = y;
+  g_cursor.valid = true;
+}
+
+void app_handleFocusEvent(bool focused)
+{
+  g_state.focused = focused;
+  if (!app_inputEnabled())
+    return;
+
+  if (!focused)
+  {
+    setGrabQuiet(false);
+    setCursorInView(false);
+  }
+
+  g_cursor.realign = true;
+  g_state.ds->realignPointer();
+}
+
+void app_handleCloseEvent(void)
+{
+  if (!params.ignoreQuit || !g_cursor.inView)
+    g_state.state = APP_STATE_SHUTDOWN;
+}
+
+static void alignToGuest(void)
 {
   if (SDL_HasEvent(e_SDLEvent))
     return;
@@ -123,76 +181,103 @@ static void alignToGuest()
   SDL_PushEvent(&event);
 }
 
-static void updatePositionInfo()
+static void updatePositionInfo(void)
 {
-  if (g_state.haveSrcSize)
+  if (!g_state.haveSrcSize)
+    goto done;
+
+  float srcW;
+  float srcH;
+  switch(params.winRotate)
   {
-    if (params.keepAspect)
+    case LG_ROTATE_0:
+    case LG_ROTATE_180:
+      srcW = g_state.srcSize.x;
+      srcH = g_state.srcSize.y;
+      break;
+
+    case LG_ROTATE_90:
+    case LG_ROTATE_270:
+      srcW = g_state.srcSize.y;
+      srcH = g_state.srcSize.x;
+      break;
+
+    default:
+      assert(!"unreachable");
+  }
+
+  if (params.keepAspect)
+  {
+    const float srcAspect = srcH / srcW;
+    const float wndAspect = (float)g_state.windowH / (float)g_state.windowW;
+    bool force = true;
+
+    if (params.dontUpscale &&
+        srcW <= g_state.windowW &&
+        srcH <= g_state.windowH)
     {
-      const float srcAspect = (float)g_state.srcSize.y / (float)g_state.srcSize.x;
-      const float wndAspect = (float)g_state.windowH / (float)g_state.windowW;
-      bool force = true;
-
-      if (params.dontUpscale &&
-          g_state.srcSize.x <= g_state.windowW &&
-          g_state.srcSize.y <= g_state.windowH)
-      {
-        force = false;
-        g_state.dstRect.w = g_state.srcSize.x;
-        g_state.dstRect.h = g_state.srcSize.y;
-        g_state.dstRect.x = g_state.windowCX - g_state.srcSize.x / 2;
-        g_state.dstRect.y = g_state.windowCY - g_state.srcSize.y / 2;
-      }
-      else
-      if ((int)(wndAspect * 1000) == (int)(srcAspect * 1000))
-      {
-        force           = false;
-        g_state.dstRect.w = g_state.windowW;
-        g_state.dstRect.h = g_state.windowH;
-        g_state.dstRect.x = 0;
-        g_state.dstRect.y = 0;
-      }
-      else
-      if (wndAspect < srcAspect)
-      {
-        g_state.dstRect.w = (float)g_state.windowH / srcAspect;
-        g_state.dstRect.h = g_state.windowH;
-        g_state.dstRect.x = (g_state.windowW >> 1) - (g_state.dstRect.w >> 1);
-        g_state.dstRect.y = 0;
-      }
-      else
-      {
-        g_state.dstRect.w = g_state.windowW;
-        g_state.dstRect.h = (float)g_state.windowW * srcAspect;
-        g_state.dstRect.x = 0;
-        g_state.dstRect.y = (g_state.windowH >> 1) - (g_state.dstRect.h >> 1);
-      }
-
-      if (force && params.forceAspect)
-      {
-        g_state.resizeTimeout = microtime() + RESIZE_TIMEOUT;
-        g_state.resizeDone    = false;
-      }
+      force = false;
+      g_state.dstRect.w = srcW;
+      g_state.dstRect.h = srcH;
+      g_state.dstRect.x = g_state.windowCX - srcW / 2;
+      g_state.dstRect.y = g_state.windowCY - srcH / 2;
+    }
+    else
+    if ((int)(wndAspect * 1000) == (int)(srcAspect * 1000))
+    {
+      force           = false;
+      g_state.dstRect.w = g_state.windowW;
+      g_state.dstRect.h = g_state.windowH;
+      g_state.dstRect.x = 0;
+      g_state.dstRect.y = 0;
+    }
+    else
+    if (wndAspect < srcAspect)
+    {
+      g_state.dstRect.w = (float)g_state.windowH / srcAspect;
+      g_state.dstRect.h = g_state.windowH;
+      g_state.dstRect.x = (g_state.windowW >> 1) - (g_state.dstRect.w >> 1);
+      g_state.dstRect.y = 0;
     }
     else
     {
-      g_state.dstRect.x = 0;
-      g_state.dstRect.y = 0;
       g_state.dstRect.w = g_state.windowW;
-      g_state.dstRect.h = g_state.windowH;
+      g_state.dstRect.h = (float)g_state.windowW * srcAspect;
+      g_state.dstRect.x = 0;
+      g_state.dstRect.y = (g_state.windowH >> 1) - (g_state.dstRect.h >> 1);
     }
-    g_state.dstRect.valid = true;
 
-    g_cursor.useScale = (
-        g_state.srcSize.y       != g_state.dstRect.h ||
-        g_state.srcSize.x       != g_state.dstRect.w ||
-        g_cursor.guest.dpiScale != 100);
+    if (force && params.forceAspect)
+    {
+      g_state.resizeTimeout = microtime() + RESIZE_TIMEOUT;
+      g_state.resizeDone    = false;
+    }
+  }
+  else
+  {
+    g_state.dstRect.x = 0;
+    g_state.dstRect.y = 0;
+    g_state.dstRect.w = g_state.windowW;
+    g_state.dstRect.h = g_state.windowH;
+  }
+  g_state.dstRect.valid = true;
 
-    g_cursor.scale.x  = (float)g_state.srcSize.y / (float)g_state.dstRect.h;
-    g_cursor.scale.y  = (float)g_state.srcSize.x / (float)g_state.dstRect.w;
-    g_cursor.dpiScale = g_cursor.guest.dpiScale / 100.0f;
+  g_cursor.useScale = (
+      srcH       != g_state.dstRect.h ||
+      srcW       != g_state.dstRect.w ||
+      g_cursor.guest.dpiScale != 100);
+
+  g_cursor.scale.x  = (float)srcW / (float)g_state.dstRect.w;
+  g_cursor.scale.y  = (float)srcH / (float)g_state.dstRect.h;
+  g_cursor.dpiScale = g_cursor.guest.dpiScale / 100.0f;
+
+  if (!g_state.posInfoValid)
+  {
+    g_state.posInfoValid = true;
+    g_state.ds->realignPointer();
   }
 
+done:
   atomic_fetch_add(&g_state.lgrResize, 1);
 }
 
@@ -226,11 +311,12 @@ static int renderThread(void * unused)
     if (resize)
     {
       if (g_state.lgr)
-        g_state.lgr->on_resize(g_state.lgrData, g_state.windowW, g_state.windowH, g_state.dstRect);
+        g_state.lgr->on_resize(g_state.lgrData, g_state.windowW, g_state.windowH,
+            g_state.dstRect, params.winRotate);
       atomic_compare_exchange_weak(&g_state.lgrResize, &resize, 0);
     }
 
-    if (!g_state.lgr->render(g_state.lgrData, g_state.window))
+    if (!g_state.lgr->render(g_state.lgrData, g_state.window, params.winRotate))
       break;
 
     if (params.showFPS)
@@ -320,7 +406,7 @@ static int cursorThread(void * unused)
           g_state.lgr->on_mouse_event
           (
             g_state.lgrData,
-            g_cursor.guest.visible && g_cursor.draw,
+            g_cursor.guest.visible && (g_cursor.draw || !params.useSpiceInput),
             g_cursor.guest.x,
             g_cursor.guest.y
           );
@@ -400,7 +486,7 @@ static int cursorThread(void * unused)
       g_cursor.guest.valid = true;
 
       // if the state just became valid
-      if (valid != true && inputEnabled())
+      if (valid != true && app_inputEnabled())
         alignToGuest();
     }
 
@@ -410,12 +496,12 @@ static int cursorThread(void * unused)
     g_state.lgr->on_mouse_event
     (
       g_state.lgrData,
-      g_cursor.guest.visible && g_cursor.draw,
+      g_cursor.guest.visible && (g_cursor.draw || !params.useSpiceInput),
       g_cursor.guest.x,
       g_cursor.guest.y
     );
 
-    if (params.mouseRedraw)
+    if (params.mouseRedraw && g_cursor.guest.visible)
       lgSignalEvent(e_frame);
   }
 
@@ -436,8 +522,7 @@ static int frameThread(void * unused)
   PLGMPClientQueue queue;
 
   uint32_t          formatVer = 0;
-  bool              formatValid = false;
-  size_t            dataSize;
+  size_t            dataSize  = 0;
   LG_RendererFormat lgrFormat;
 
   struct DMAFrameInfo dmaInfo[LGMP_Q_FRAME_LEN] = {0};
@@ -510,7 +595,7 @@ static int frameThread(void * unused)
     KVMFRFrame * frame       = (KVMFRFrame *)msg.mem;
     struct DMAFrameInfo *dma = NULL;
 
-    if (!formatValid || frame->formatVer != formatVer)
+    if (!g_state.formatValid || frame->formatVer != formatVer)
     {
       // setup the renderer format with the frame format details
       lgrFormat.type   = frame->type;
@@ -518,6 +603,15 @@ static int frameThread(void * unused)
       lgrFormat.height = frame->height;
       lgrFormat.stride = frame->stride;
       lgrFormat.pitch  = frame->pitch;
+
+      switch(frame->rotation)
+      {
+        case FRAME_ROT_0  : lgrFormat.rotate = LG_ROTATE_0  ; break;
+        case FRAME_ROT_90 : lgrFormat.rotate = LG_ROTATE_90 ; break;
+        case FRAME_ROT_180: lgrFormat.rotate = LG_ROTATE_180; break;
+        case FRAME_ROT_270: lgrFormat.rotate = LG_ROTATE_270; break;
+      }
+      g_state.rotate = lgrFormat.rotate;
 
       bool error = false;
       switch(frame->type)
@@ -534,12 +628,6 @@ static int frameThread(void * unused)
           lgrFormat.bpp  = 64;
           break;
 
-        case FRAME_TYPE_YUV420:
-          dataSize       = lgrFormat.height * lgrFormat.width;
-          dataSize      += (dataSize / 4) * 2;
-          lgrFormat.bpp  = 12;
-          break;
-
         default:
           DEBUG_ERROR("Unsupported frameType");
           error = true;
@@ -553,13 +641,14 @@ static int frameThread(void * unused)
         break;
       }
 
-      formatValid = true;
-      formatVer   = frame->formatVer;
+      g_state.formatValid = true;
+      formatVer = frame->formatVer;
 
-      DEBUG_INFO("Format: %s %ux%u %u %u",
+      DEBUG_INFO("Format: %s %ux%u stride:%u pitch:%u rotation:%d",
           FrameTypeStr[frame->type],
           frame->width, frame->height,
-          frame->stride, frame->pitch);
+          frame->stride, frame->pitch,
+          frame->rotation);
 
       if (!g_state.lgr->on_frame_format(g_state.lgrData, lgrFormat, useDMA))
       {
@@ -671,17 +760,6 @@ int spiceThread(void * arg)
   return 0;
 }
 
-static inline const uint32_t mapScancode(SDL_Scancode scancode)
-{
-  uint32_t ps2;
-  if (scancode > (sizeof(usb_to_ps2) / sizeof(uint32_t)) || (ps2 = usb_to_ps2[scancode]) == 0)
-  {
-    DEBUG_WARN("Unable to map USB scan code: %x\n", scancode);
-    return 0;
-  }
-  return ps2;
-}
-
 static LG_ClipboardData spice_type_to_clipboard_type(const SpiceDataType type)
 {
   switch(type)
@@ -712,7 +790,7 @@ static SpiceDataType clipboard_type_to_spice_type(const LG_ClipboardData type)
   }
 }
 
-void clipboardRelease()
+void app_clipboardRelease(void)
 {
   if (!params.clipboardToVM)
     return;
@@ -720,7 +798,7 @@ void clipboardRelease()
   spice_clipboard_release();
 }
 
-void clipboardNotify(const LG_ClipboardData type, size_t size)
+void app_clipboardNotify(const LG_ClipboardData type, size_t size)
 {
   if (!params.clipboardToVM)
     return;
@@ -741,7 +819,7 @@ void clipboardNotify(const LG_ClipboardData type, size_t size)
     spice_clipboard_data_start(g_state.cbType, size);
 }
 
-void clipboardData(const LG_ClipboardData type, uint8_t * data, size_t size)
+void app_clipboardData(const LG_ClipboardData type, uint8_t * data, size_t size)
 {
   if (!params.clipboardToVM)
     return;
@@ -759,7 +837,7 @@ void clipboardData(const LG_ClipboardData type, uint8_t * data, size_t size)
   g_state.cbXfer -= size;
 }
 
-void clipboardRequest(const LG_ClipboardReplyFn replyFn, void * opaque)
+void app_clipboardRequest(const LG_ClipboardReplyFn replyFn, void * opaque)
 {
   if (!params.clipboardToLocal)
     return;
@@ -779,11 +857,11 @@ void spiceClipboardNotice(const SpiceDataType type)
   if (!params.clipboardToLocal)
     return;
 
-  if (!g_state.lgc || !g_state.lgc->notice)
+  if (!g_state.cbAvailable)
     return;
 
   g_state.cbType = type;
-  g_state.lgc->notice(clipboardRequest, spice_type_to_clipboard_type(type));
+  g_state.ds->cbNotice(spice_type_to_clipboard_type(type));
 }
 
 void spiceClipboardData(const SpiceDataType type, uint8_t * buffer, uint32_t size)
@@ -817,13 +895,13 @@ void spiceClipboardData(const SpiceDataType type, uint8_t * buffer, uint32_t siz
   }
 }
 
-void spiceClipboardRelease()
+void spiceClipboardRelease(void)
 {
   if (!params.clipboardToLocal)
     return;
 
-  if (g_state.lgc && g_state.lgc->release)
-    g_state.lgc->release();
+  if (g_state.cbAvailable)
+    g_state.ds->cbRelease();
 }
 
 void spiceClipboardRequest(const SpiceDataType type)
@@ -831,22 +909,26 @@ void spiceClipboardRequest(const SpiceDataType type)
   if (!params.clipboardToVM)
     return;
 
-  if (g_state.lgc && g_state.lgc->request)
-    g_state.lgc->request(spice_type_to_clipboard_type(type));
+  if (g_state.cbAvailable)
+    g_state.ds->cbRequest(spice_type_to_clipboard_type(type));
 }
 
-static void warpMouse(int x, int y, bool disable)
+static bool warpPointer(int x, int y, bool exiting)
 {
-  if (g_cursor.warpState == WARP_STATE_OFF)
-    return;
+  if (!g_cursor.inWindow && !exiting)
+    return false;
 
-  if (disable)
+  if (g_cursor.warpState == WARP_STATE_OFF)
+    return false;
+
+  if (exiting)
     g_cursor.warpState = WARP_STATE_OFF;
 
   if (g_cursor.pos.x == x && g_cursor.pos.y == y)
-    return;
+    return true;
 
-  wmWarpMouse(x, y);
+  g_state.ds->warpPointer(x, y, exiting);
+  return true;
 }
 
 static bool isValidCursorLocation(int x, int y)
@@ -869,8 +951,18 @@ static void cursorToInt(double ex, double ey, int *x, int *y)
   if (params.mouseSmoothing && !(g_cursor.grab && params.rawMouse))
   {
     static struct DoublePoint last = { 0 };
-    ex = last.x = (last.x + ex) / 2.0;
-    ey = last.y = (last.y + ey) / 2.0;
+
+    /* only apply smoothing to small deltas */
+    if (fabs(ex - last.x) < 5.0 && fabs(ey - last.y) < 5.0)
+    {
+      ex = last.x = (last.x + ex) / 2.0;
+      ey = last.y = (last.y + ey) / 2.0;
+    }
+    else
+    {
+      last.x = ex;
+      last.y = ey;
+    }
   }
 
   /* convert to int accumulating the fractional error */
@@ -883,10 +975,63 @@ static void cursorToInt(double ex, double ey, int *x, int *y)
   *y = (int)ey;
 }
 
-void handleMouseGrabbed(double ex, double ey)
+static void setCursorInView(bool enable)
 {
-  int x, y;
+  // if the state has not changed, don't do anything else
+  if (g_cursor.inView == enable)
+    return;
 
+  if (enable && !g_state.focused)
+    return;
+
+  // do not allow the view to become active if any mouse buttons are being held,
+  // this fixes issues with meta window resizing.
+  if (enable && g_cursor.buttons)
+    return;
+
+  g_cursor.inView = enable;
+  g_cursor.draw   = (params.alwaysShowCursor || params.captureInputOnly)
+    ? true : enable;
+  g_cursor.redraw = true;
+
+  /* if the display server does not support warp, then we can not operate in
+   * always relative mode and we should not grab the pointer */
+  bool warpSupport = true;
+  app_getProp(LG_DS_WARP_SUPPORT, &warpSupport);
+
+  g_cursor.warpState = enable ? WARP_STATE_ON : WARP_STATE_OFF;
+
+  if (enable)
+  {
+    if (params.hideMouse)
+      SDL_ShowCursor(SDL_DISABLE);
+
+    if (warpSupport && !params.captureInputOnly)
+      g_state.ds->grabPointer();
+
+    if (params.grabKeyboardOnFocus)
+      g_state.ds->grabKeyboard();
+  }
+  else
+  {
+    if (params.hideMouse)
+      SDL_ShowCursor(SDL_ENABLE);
+
+    if (warpSupport)
+      g_state.ds->ungrabPointer();
+
+    g_state.ds->ungrabKeyboard();
+  }
+
+  g_cursor.warpState = WARP_STATE_ON;
+}
+
+void app_handleMouseGrabbed(double ex, double ey)
+{
+  if (!app_inputEnabled())
+    return;
+
+  int x, y;
   if (params.rawMouse && !g_cursor.useScale)
   {
     /* raw unscaled input are always round numbers */
@@ -908,46 +1053,224 @@ void handleMouseGrabbed(double ex, double ey)
     DEBUG_ERROR("failed to send mouse motion message");
 }
 
-static void guestCurToLocal(struct DoublePoint *local)
+void app_handleButtonPress(int button)
 {
-  local->x = (g_cursor.guest.x + g_cursor.guest.hx) / g_cursor.scale.x;
-  local->y = (g_cursor.guest.y + g_cursor.guest.hy) / g_cursor.scale.y;
+  if (!app_inputEnabled() || !g_cursor.inView)
+    return;
+
+  g_cursor.buttons |= (1U << button);
+
+  if (!spice_mouse_press(button))
+    DEBUG_ERROR("SDL_MOUSEBUTTONDOWN: failed to send message");
 }
 
-// On Wayland, our normal cursor logic does not work due to the lack of cursor
-// warp support. Instead, we attempt a best-effort emulation which works with a
-// 1:1 mouse movement patch applied in the guest. For anything fancy, use
-// capture mode.
-static void handleMouseWayland()
+void app_handleButtonRelease(int button)
 {
-  double ex = (g_cursor.pos.x - g_cursor.guest.x) / g_cursor.dpiScale;
-  double ey = (g_cursor.pos.y - g_cursor.guest.y) / g_cursor.dpiScale;
+  if (!app_inputEnabled())
+    return;
 
-  int x, y;
-  cursorToInt(ex, ey, &x, &y);
+  g_cursor.buttons &= ~(1U << button);
 
-  g_cursor.guest.x += x;
-  g_cursor.guest.y += y;
-
-  if (!spice_mouse_motion(x, y))
-    DEBUG_ERROR("failed to send mouse motion message");
+  if (!spice_mouse_release(button))
+    DEBUG_ERROR("SDL_MOUSEBUTTONUP: failed to send message");
 }
 
-static void handleMouseNormal(double ex, double ey)
+void app_handleKeyPress(int sc)
 {
-  /* if we don't have the current cursor pos just send cursor movements */
+  if (sc == params.escapeKey && !g_state.escapeActive)
+  {
+    g_state.escapeActive = true;
+    g_state.escapeAction = -1;
+    return;
+  }
+
+  if (g_state.escapeActive)
+  {
+    g_state.escapeAction = sc;
+    return;
+  }
+
+  if (!app_inputEnabled())
+    return;
+
+  if (params.ignoreWindowsKeys && (sc == KEY_LEFTMETA || sc == KEY_RIGHTMETA))
+    return;
+
+  if (!g_state.keyDown[sc])
+  {
+    uint32_t ps2 = xfree86_to_ps2[sc];
+    if (!ps2)
+      return;
+
+    if (spice_key_down(ps2))
+      g_state.keyDown[sc] = true;
+    else
+    {
+      DEBUG_ERROR("SDL_KEYDOWN: failed to send message");
+      return;
+    }
+  }
+}
+
+void app_handleKeyRelease(int sc)
+{
+  if (g_state.escapeActive)
+  {
+    if (g_state.escapeAction == -1)
+    {
+      if (params.useSpiceInput)
+        setGrab(!g_cursor.grab);
+    }
+    else
+    {
+      KeybindHandle handle = g_state.bindings[sc];
+      if (handle)
+      {
+        handle->callback(sc, handle->opaque);
+        return;
+      }
+    }
+
+    if (sc == params.escapeKey)
+      g_state.escapeActive = false;
+  }
+
+  if (!app_inputEnabled())
+    return;
+
+  // avoid sending key up events when we didn't send a down
+  if (!g_state.keyDown[sc])
+    return;
+
+  if (params.ignoreWindowsKeys && (sc == KEY_LEFTMETA || sc == KEY_RIGHTMETA))
+    return;
+
+  uint32_t ps2 = xfree86_to_ps2[sc];
+  if (!ps2)
+    return;
+
+  if (spice_key_up(ps2))
+    g_state.keyDown[sc] = false;
+  else
+  {
+    DEBUG_ERROR("SDL_KEYUP: failed to send message");
+    return;
+  }
+}
+
+static void rotatePoint(struct DoublePoint *point)
+{
+  double temp;
+
+  switch((g_state.rotate + params.winRotate) % LG_ROTATE_MAX)
+  {
+    case LG_ROTATE_0:
+      break;
+
+    case LG_ROTATE_90:
+      temp = point->x;
+      point->x =  point->y;
+      point->y = -temp;
+      break;
+
+    case LG_ROTATE_180:
+      point->x = -point->x;
+      point->y = -point->y;
+      break;
+
+    case LG_ROTATE_270:
+      temp = point->x;
+      point->x = -point->y;
+      point->y =  temp;
+      break;
+  }
+}
+
+static bool guestCurToLocal(struct DoublePoint *local)
+{
+  if (!g_cursor.guest.valid || !g_state.posInfoValid)
+    return false;
+
+  const struct DoublePoint point =
+  {
+    .x = g_cursor.guest.x + g_cursor.guest.hx,
+    .y = g_cursor.guest.y + g_cursor.guest.hy
+  };
+
+  switch((g_state.rotate + params.winRotate) % LG_ROTATE_MAX)
+  {
+    case LG_ROTATE_0:
+      local->x = (point.x / g_cursor.scale.x) + g_state.dstRect.x;
+      local->y = (point.y / g_cursor.scale.y) + g_state.dstRect.y;;
+      break;
+
+    case LG_ROTATE_90:
+      local->x = (g_state.dstRect.x + g_state.dstRect.w) -
+        point.y / g_cursor.scale.y;
+      local->y = (point.x / g_cursor.scale.x) + g_state.dstRect.y;
+      break;
+
+    case LG_ROTATE_180:
+      local->x = (g_state.dstRect.x + g_state.dstRect.w) -
+        point.x / g_cursor.scale.x;
+      local->y = (g_state.dstRect.y + g_state.dstRect.h) -
+        point.y / g_cursor.scale.y;
+      break;
+
+    case LG_ROTATE_270:
+      local->x = (point.y / g_cursor.scale.y) + g_state.dstRect.x;
+      local->y = (g_state.dstRect.y + g_state.dstRect.h) -
+        point.x / g_cursor.scale.x;
+      break;
+  }
+
+  return true;
+}
+
+inline static void localCurToGuest(struct DoublePoint *guest)
+{
+  const struct DoublePoint point =
+    g_cursor.pos;
+
+  switch((g_state.rotate + params.winRotate) % LG_ROTATE_MAX)
+  {
+    case LG_ROTATE_0:
+      guest->x = (point.x - g_state.dstRect.x) * g_cursor.scale.x;
+      guest->y = (point.y - g_state.dstRect.y) * g_cursor.scale.y;
+      break;
+
+    case LG_ROTATE_90:
+      guest->x = (point.y - g_state.dstRect.y) * g_cursor.scale.y;
+      guest->y = (g_state.dstRect.w - point.x + g_state.dstRect.x)
+        * g_cursor.scale.x;
+      break;
+
+    case LG_ROTATE_180:
+      guest->x = (g_state.dstRect.w - point.x + g_state.dstRect.x)
+        * g_cursor.scale.x;
+      guest->y = (g_state.dstRect.h - point.y + g_state.dstRect.y)
+        * g_cursor.scale.y;
+      break;
+
+    case LG_ROTATE_270:
+      guest->x = (g_state.dstRect.h - point.y + g_state.dstRect.y)
+        * g_cursor.scale.y;
+      guest->y = (point.x - g_state.dstRect.x) * g_cursor.scale.x;
+      break;
+
+    default:
+      assert(!"unreachable");
+  }
+}
+
+void app_handleMouseNormal(double ex, double ey)
+{
+  // prevent cursor handling outside of capture if the position is not known
   if (!g_cursor.guest.valid)
-  {
-    if (g_cursor.grab)
-      handleMouseGrabbed(ex, ey);
     return;
-  }
 
-  if (g_state.wminfo.subsystem == SDL_SYSWM_WAYLAND)
-  {
-    handleMouseWayland();
+  if (!app_inputEnabled())
     return;
-  }
 
   /* scale the movement to the guest */
   if (g_cursor.useScale && params.scaleMouseInput)
@@ -957,8 +1280,6 @@ static void handleMouseNormal(double ex, double ey)
   }
 
   bool testExit = true;
-
-  /* if the cursor was outside the viewport, check if it moved in */
   if (!g_cursor.inView)
   {
     const bool inView =
@@ -967,88 +1288,86 @@ static void handleMouseNormal(double ex, double ey)
       g_cursor.pos.y >= g_state.dstRect.y                     &&
       g_cursor.pos.y <  g_state.dstRect.y + g_state.dstRect.h;
 
+    setCursorInView(inView);
     if (inView)
-    {
-      if (params.hideMouse)
-        SDL_ShowCursor(SDL_DISABLE);
-
-      if (g_state.focused)
-      {
-        /* the cursor moved in, enable grab mode */
-        g_cursor.inView = true;
-        g_cursor.draw   = true;
-        g_cursor.redraw = true;
-
-        g_cursor.warpState = WARP_STATE_ON;
-        wmGrabPointer();
-      }
-
-      struct DoublePoint guest =
-      {
-        .x = (g_cursor.pos.x - g_state.dstRect.x) * g_cursor.scale.x,
-        .y = (g_cursor.pos.y - g_state.dstRect.y) * g_cursor.scale.y
-      };
-
-      /* add the difference to the offset */
-      ex += guest.x - (g_cursor.guest.x + g_cursor.guest.hx);
-      ey += guest.y - (g_cursor.guest.y + g_cursor.guest.hy);
-
-      /* don't test for an exit as we just entered, we can get into a enter/exit
-       * loop otherwise */
-      testExit = false;
-    }
-    else
-    {
-      /* nothing to do if the cursor is not in the guest window */
-      return;
-    }
+      g_cursor.realign = true;
   }
 
-  /* if we are in "autoCapture" and the delta was large don't test for exit */
+  /* nothing to do if we are outside the viewport */
+  if (!g_cursor.inView)
+    return;
+
+  /*
+   * do not pass mouse events to the guest if we do not have focus, this must be
+   * done after the inView test has been performed so that when focus is gained
+   * we know if we should be drawing the cursor.
+   */
+  if (!g_state.focused)
+    return;
+
+  /* if we have been instructed to realign */
+  if (g_cursor.realign)
+  {
+    g_cursor.realign = false;
+
+    struct DoublePoint guest;
+    localCurToGuest(&guest);
+
+    /* add the difference to the offset */
+    ex += guest.x - (g_cursor.guest.x + g_cursor.guest.hx);
+    ey += guest.y - (g_cursor.guest.y + g_cursor.guest.hy);
+
+    /* don't test for an exit as we just entered, we can get into a enter/exit
+     * loop otherwise */
+    testExit = false;
+  }
+
+ /* if we are in "autoCapture" and the delta was large don't test for exit */
   if (params.autoCapture &&
-      (abs(ex) > 100.0 / g_cursor.scale.x || abs(ey) > 100.0 / g_cursor.scale.y))
+      (fabs(ex) > 100.0 / g_cursor.scale.x || fabs(ey) > 100.0 / g_cursor.scale.y))
     testExit = false;
 
-  /* translate the guests position to our coordinate space */
-  struct DoublePoint local;
-  guestCurToLocal(&local);
+  /* if any buttons are held we should not allow exit to happen */
+  if (g_cursor.buttons)
+    testExit = false;
 
-  /* check if the move would push the cursor outside the guest's viewport */
-  if (testExit && (
-      local.x + ex <  0.0 ||
-      local.y + ey <  0.0 ||
-      local.x + ex >= g_state.dstRect.w ||
-      local.y + ey >= g_state.dstRect.h))
+  if (testExit)
   {
-    local.x += ex;
-    local.y += ey;
-    const int tx = ((local.x <= 0.0) ? floor(local.x) : ceil(local.x)) +
-      g_state.dstRect.x;
-    const int ty = ((local.y <= 0.0) ? floor(local.y) : ceil(local.y)) +
-      g_state.dstRect.y;
+    /* translate the move to the guests orientation */
+    struct DoublePoint move = {.x = ex, .y = ey};
+    rotatePoint(&move);
 
-    if (isValidCursorLocation(
-          g_state.windowPos.x + g_state.border.x + tx,
-          g_state.windowPos.y + g_state.border.y + ty))
+    /* translate the guests position to our coordinate space */
+    struct DoublePoint local;
+    guestCurToLocal(&local);
+
+    /* check if the move would push the cursor outside the guest's viewport */
+    if (
+        local.x + move.x <  g_state.dstRect.x ||
+        local.y + move.y <  g_state.dstRect.y ||
+        local.x + move.x >= g_state.dstRect.x + g_state.dstRect.w ||
+        local.y + move.y >= g_state.dstRect.y + g_state.dstRect.h)
     {
-      if (params.hideMouse)
-        SDL_ShowCursor(SDL_ENABLE);
+      local.x += move.x;
+      local.y += move.y;
+      const int tx = (local.x <= 0.0) ? floor(local.x) : ceil(local.x);
+      const int ty = (local.y <= 0.0) ? floor(local.y) : ceil(local.y);
 
-      g_cursor.inView = false;
+      if (isValidCursorLocation(
+            g_state.windowPos.x + g_state.border.x + tx,
+            g_state.windowPos.y + g_state.border.y + ty))
+      {
+        setCursorInView(false);
 
-      if(!params.alwaysShowCursor)
-        g_cursor.draw = false;
+        /* preempt the window leave flag if the warp will leave our window */
+        if (tx < 0 || ty < 0 || tx > g_state.windowW || ty > g_state.windowH)
+          g_cursor.inWindow = false;
 
-      g_cursor.redraw = true;
-
-      /* pre-empt the window leave flag if the warp will leave our window */
-      if (tx < 0 || ty < 0 || tx > g_state.windowW || ty > g_state.windowH)
-        g_cursor.inWindow = false;
-
-      /* ungrab the pointer and move the local cursor to the exit point */
-      wmUngrabPointer();
-      warpMouse(tx, ty, true);
-      return;
+        /* ungrab the pointer and move the local cursor to the exit point */
+        g_state.ds->ungrabPointer();
+        warpPointer(tx, ty, true);
+        return;
+      }
     }
   }
 
@@ -1063,11 +1382,11 @@ static void handleMouseNormal(double ex, double ey)
     g_cursor.delta.x += x;
     g_cursor.delta.y += y;
 
-    if (abs(g_cursor.delta.x) > 50 || abs(g_cursor.delta.y) > 50)
+    if (fabs(g_cursor.delta.x) > 50.0 || fabs(g_cursor.delta.y) > 50.0)
     {
       g_cursor.delta.x = 0;
       g_cursor.delta.y = 0;
-      warpMouse(g_state.windowCX, g_state.windowCY, false);
+      warpPointer(g_state.windowCX, g_state.windowCY, false);
     }
 
     g_cursor.guest.x = g_state.srcSize.x / 2;
@@ -1086,7 +1405,65 @@ static void handleMouseNormal(double ex, double ey)
     DEBUG_ERROR("failed to send mouse motion message");
 }
 
-static void handleResizeEvent(unsigned int w, unsigned int h)
+
+// On some display servers normal cursor logic does not work due to the lack of
+// cursor warp support. Instead, we attempt a best-effort emulation which works
+// with a 1:1 mouse movement patch applied in the guest. For anything fancy, use
+// capture mode.
+void app_handleMouseBasic()
+{
+  /* do not pass mouse events to the guest if we do not have focus */
+  if (!g_state.focused)
+    return;
+
+  if (!app_inputEnabled())
+    return;
+
+  const bool inView =
+    g_cursor.pos.x >= g_state.dstRect.x                     &&
+    g_cursor.pos.x <  g_state.dstRect.x + g_state.dstRect.w &&
+    g_cursor.pos.y >= g_state.dstRect.y                     &&
+    g_cursor.pos.y <  g_state.dstRect.y + g_state.dstRect.h;
+
+  setCursorInView(inView);
+
+  if (g_cursor.guest.dpiScale == 0)
+    return;
+
+  double px = g_cursor.pos.x;
+  double py = g_cursor.pos.y;
+
+  if (px < g_state.dstRect.x)
+    px = g_state.dstRect.x;
+  else if (px > g_state.dstRect.x + g_state.dstRect.w)
+    px = g_state.dstRect.x + g_state.dstRect.w;
+
+  if (py < g_state.dstRect.y)
+    py = g_state.dstRect.y;
+  else if (py > g_state.dstRect.y + g_state.dstRect.h)
+    py = g_state.dstRect.y + g_state.dstRect.h;
+
+  /* translate the guests position to our coordinate space */
+  struct DoublePoint local;
+  guestCurToLocal(&local);
+
+  int x = (int) round((px - local.x) / g_cursor.dpiScale);
+  int y = (int) round((py - local.y) / g_cursor.dpiScale);
+
+  g_cursor.guest.x += x;
+  g_cursor.guest.y += y;
+
+  if (!spice_mouse_motion(x, y))
+    DEBUG_ERROR("failed to send mouse motion message");
+}
+
+void app_updateWindowPos(int x, int y)
+{
+  g_state.windowPos.x = x;
+  g_state.windowPos.y = y;
+}
+
+void app_handleResizeEvent(int w, int h)
 {
   SDL_GetWindowBordersSize(g_state.window,
     &g_state.border.y,
@@ -1095,13 +1472,17 @@ static void handleResizeEvent(unsigned int w, unsigned int h)
     &g_state.border.w
   );
 
+  /* don't do anything else if the window dimensions have not changed */
+  if (g_state.windowW == w && g_state.windowH == h)
+    return;
+
   g_state.windowW  = w;
   g_state.windowH  = h;
   g_state.windowCX = w / 2;
   g_state.windowCY = h / 2;
   updatePositionInfo();
 
-  if (inputEnabled())
+  if (app_inputEnabled())
   {
     /* if the window is moved/resized causing a loss of focus while grabbed, it
      * makes it impossible to re-focus the window, so we quietly re-enter
@@ -1115,28 +1496,26 @@ static void handleResizeEvent(unsigned int w, unsigned int h)
   }
 }
 
-static void handleWindowLeave()
+void app_handleWindowLeave(void)
 {
   g_cursor.inWindow = false;
-  g_cursor.inView   = false;
+  setCursorInView(false);
 
-  if (!inputEnabled())
+  if (!app_inputEnabled())
     return;
 
   if (!params.alwaysShowCursor)
     g_cursor.draw = false;
-
   g_cursor.redraw = true;
 }
 
-static void handleWindowEnter()
+void app_handleWindowEnter(void)
 {
   g_cursor.inWindow = true;
-  if (!inputEnabled())
+  if (!app_inputEnabled())
     return;
 
-  g_cursor.draw   = true;
-  g_cursor.redraw = true;
+  g_cursor.realign = true;
 }
 
 static void setGrab(bool enable)
@@ -1162,34 +1541,48 @@ static void setGrabQuiet(bool enable)
   g_cursor.acc.x = 0.0;
   g_cursor.acc.y = 0.0;
 
+  /* if the display server does not support warp we need to ungrab the pointer
+   * here instead of in the move handler */
+  bool warpSupport = true;
+  app_getProp(LG_DS_WARP_SUPPORT, &warpSupport);
+
   if (enable)
   {
-    wmGrabPointer();
+    setCursorInView(true);
+    g_state.ignoreInput = false;
 
     if (params.grabKeyboard)
-      wmGrabKeyboard();
+      g_state.ds->grabKeyboard();
+
+    g_state.ds->grabPointer();
   }
   else
   {
     if (params.grabKeyboard)
     {
-      if (!g_state.focused || !params.grabKeyboardOnFocus)
-        wmUngrabKeyboard();
+      if (!g_state.focused || params.captureInputOnly)
+        g_state.ds->ungrabKeyboard();
     }
 
-    wmUngrabPointer();
+    if (!warpSupport || params.captureInputOnly || !g_state.formatValid)
+      g_state.ds->ungrabPointer();
+
+    // if exiting capture when input on capture only, we want to show the cursor
+    if (params.captureInputOnly || !params.hideMouse)
+      alignToGuest();
   }
-
-  // if exiting capture when input on capture only, we want to show the cursor
-  if (!enable && (params.captureInputOnly || !params.hideMouse))
-    alignToGuest();
-
-  if (g_cursor.grab)
-    g_cursor.inView = true;
 }
 
 int eventFilter(void * userdata, SDL_Event * event)
 {
+  if (g_state.ds->eventFilter(event))
+    return 0;
+
+  // always include the default handler (SDL) for any unhandled events
+  if (g_state.ds != LG_DisplayServers[0])
+    if (LG_DisplayServers[0]->eventFilter(event))
+      return 0;
+
   if (event->type == e_SDLEvent)
   {
     switch(event->user.code)
@@ -1200,451 +1593,36 @@ int eventFilter(void * userdata, SDL_Event * event)
           break;
 
         struct DoublePoint local;
-        guestCurToLocal(&local);
-        warpMouse(round(local.x), round(local.y), false);
+        if (guestCurToLocal(&local))
+          if (warpPointer(round(local.x), round(local.y), false))
+            setCursorInView(true);
         break;
       }
     }
     return 0;
   }
 
-  switch(event->type)
-  {
-    case SDL_QUIT:
-    {
-      if (!params.ignoreQuit)
-      {
-        DEBUG_INFO("Quit event received, exiting...");
-        g_state.state = APP_STATE_SHUTDOWN;
-      }
-      return 0;
-    }
-
-    case SDL_WINDOWEVENT:
-    {
-      switch(event->window.event)
-      {
-        case SDL_WINDOWEVENT_ENTER:
-          if (g_state.wminfo.subsystem == SDL_SYSWM_WAYLAND)
-            g_cursor.inView = true;
-          if (g_state.wminfo.subsystem != SDL_SYSWM_X11)
-            handleWindowEnter();
-          break;
-
-        case SDL_WINDOWEVENT_LEAVE:
-          if (g_state.wminfo.subsystem == SDL_SYSWM_WAYLAND)
-            g_cursor.inView = false;
-          if (g_state.wminfo.subsystem != SDL_SYSWM_X11)
-            handleWindowLeave();
-          break;
-
-        case SDL_WINDOWEVENT_FOCUS_GAINED:
-          if (g_state.wminfo.subsystem != SDL_SYSWM_X11)
-          {
-            g_state.focused = true;
-
-            if (!inputEnabled())
-              break;
-            if (params.grabKeyboardOnFocus)
-              wmGrabKeyboard();
-          }
-          break;
-
-        case SDL_WINDOWEVENT_FOCUS_LOST:
-          if (g_state.wminfo.subsystem != SDL_SYSWM_X11)
-          {
-            g_state.focused = false;
-
-            if (!inputEnabled())
-              break;
-            if (params.grabKeyboardOnFocus)
-              wmUngrabKeyboard();
-          }
-          break;
-
-        case SDL_WINDOWEVENT_SIZE_CHANGED:
-        case SDL_WINDOWEVENT_RESIZED:
-          if (g_state.wminfo.subsystem != SDL_SYSWM_X11)
-            handleResizeEvent(event->window.data1, event->window.data2);
-          break;
-
-        case SDL_WINDOWEVENT_MOVED:
-          if (g_state.wminfo.subsystem != SDL_SYSWM_X11)
-          {
-            g_state.windowPos.x = event->window.data1;
-            g_state.windowPos.y = event->window.data2;
-          }
-          break;
-
-        case SDL_WINDOWEVENT_CLOSE:
-          if (!params.ignoreQuit || !g_cursor.inView)
-            g_state.state = APP_STATE_SHUTDOWN;
-          break;
-      }
-      return 0;
-    }
-
-    case SDL_SYSWMEVENT:
-    {
-      // When the window manager forces the window size after calling SDL_SetWindowSize, SDL
-      // ignores this update and caches the incorrect window size. As such all related details
-      // are incorect including mouse movement information as it clips to the old window size.
-      if (g_state.wminfo.subsystem == SDL_SYSWM_X11)
-      {
-        XEvent xe = event->syswm.msg->msg.x11.event;
-
-        switch(xe.type)
-        {
-          case ConfigureNotify:
-          {
-            /* the window may have been re-parented so we need to translate to
-             * ensure we get the screen top left position of the window */
-            Window child;
-            XTranslateCoordinates(g_state.wminfo.info.x11.display,
-                g_state.wminfo.info.x11.window,
-                DefaultRootWindow(g_state.wminfo.info.x11.display),
-                0, 0, &g_state.windowPos.x, &g_state.windowPos.y,
-                &child);
-
-            handleResizeEvent(xe.xconfigure.width, xe.xconfigure.height);
-            break;
-          }
-
-#if SDL_VIDEO_DRIVER_X11_XINPUT2
-          /* support movements via XInput2 */
-          case GenericEvent:
-          {
-            if (!inputEnabled())
-              break;
-
-            XGenericEventCookie *cookie = (XGenericEventCookie*)&xe.xcookie;
-            if (cookie->extension != g_XInputOp)
-              break;
-
-            switch(cookie->evtype)
-            {
-              case XI_Motion:
-              {
-                if (!g_cursor.inWindow)
-                  break;
-
-                XIDeviceEvent *device = cookie->data;
-                g_cursor.pos.x = device->event_x;
-                g_cursor.pos.y = device->event_y;
-                break;
-              }
-
-              case XI_RawMotion:
-              {
-                if (!g_cursor.inWindow)
-                  break;
-
-                XIRawEvent *raw = cookie->data;
-                double raw_axis[2];
-                double axis[2];
-
-                /* select the active validators for the X & Y axis */
-                double *valuator = raw->valuators.values;
-                double *r_value  = raw->raw_values;
-                int    count     = 0;
-                for(int i = 0; i < raw->valuators.mask_len * 8; ++i)
-                {
-                  if (XIMaskIsSet(raw->valuators.mask, i))
-                  {
-                    raw_axis[count] = *r_value;
-                    axis    [count] = *valuator;
-                    ++count;
-
-                    if (count == 2)
-                      break;
-
-                    ++valuator;
-                    ++r_value;
-                  }
-                }
-
-                /* filter out scroll wheel and other events */
-                if (count < 2)
-                  break;
-
-                /* filter out duplicate events */
-                static Time   prev_time    = 0;
-                static double prev_axis[2] = {0};
-                if (raw->time == prev_time &&
-                    axis[0] == prev_axis[0] &&
-                    axis[1] == prev_axis[1])
-                  break;
-
-                prev_time = raw->time;
-                prev_axis[0] = axis[0];
-                prev_axis[1] = axis[1];
-
-                if (g_cursor.grab)
-                {
-                  if (params.rawMouse)
-                    handleMouseGrabbed(raw_axis[0], raw_axis[1]);
-                  else
-                    handleMouseGrabbed(axis[0], axis[1]);
-                }
-                else
-                  if (g_cursor.inWindow)
-                    handleMouseNormal(axis[0], axis[1]);
-                break;
-              }
-            }
-
-            break;
-          }
-#endif
-
-          case EnterNotify:
-          {
-            int x, y;
-            Window child;
-            XTranslateCoordinates(g_state.wminfo.info.x11.display,
-                DefaultRootWindow(g_state.wminfo.info.x11.display),
-                g_state.wminfo.info.x11.window,
-                xe.xcrossing.x_root, xe.xcrossing.y_root,
-                &x, &y,
-                &child);
-
-            g_cursor.pos.x = x;
-            g_cursor.pos.y = y;
-            handleWindowEnter();
-            break;
-          }
-
-          case LeaveNotify:
-          {
-            if (xe.xcrossing.mode != NotifyNormal)
-              break;
-
-            int x, y;
-            Window child;
-            XTranslateCoordinates(g_state.wminfo.info.x11.display,
-                DefaultRootWindow(g_state.wminfo.info.x11.display),
-                g_state.wminfo.info.x11.window,
-                xe.xcrossing.x_root, xe.xcrossing.y_root,
-                &x, &y,
-                &child);
-
-            g_cursor.pos.x = x;
-            g_cursor.pos.y = y;
-            handleWindowLeave();
-            break;
-          }
-
-          case FocusIn:
-            g_state.focused = true;
-
-            if (!inputEnabled())
-              break;
-
-            if (xe.xfocus.mode == NotifyNormal ||
-                xe.xfocus.mode == NotifyUngrab)
-            {
-              if (params.grabKeyboardOnFocus)
-                wmGrabKeyboard();
-            }
-            break;
-
-          case FocusOut:
-            g_state.focused = false;
-
-            if (!inputEnabled())
-              break;
-
-            if (xe.xfocus.mode == NotifyNormal ||
-                xe.xfocus.mode == NotifyWhileGrabbed)
-            {
-              if (g_cursor.grab)
-                setGrab(false);
-              else
-              {
-                if (params.grabKeyboardOnFocus)
-                  wmUngrabKeyboard();
-              }
-            }
-            break;
-        }
-      }
-
-      if (params.useSpiceClipboard && g_state.lgc && g_state.lgc->wmevent)
-        g_state.lgc->wmevent(event->syswm.msg);
-      return 0;
-    }
-
-    case SDL_MOUSEMOTION:
-    {
-      if (g_state.wminfo.subsystem == SDL_SYSWM_X11)
-        break;
-
-      g_cursor.pos.x = event->motion.x;
-      g_cursor.pos.y = event->motion.y;
-
-      if (g_cursor.grab)
-      {
-        // On Wayland, wm.c calls handleMouseGrabbed, bypassing the SDL event
-        // loop.
-        if (g_state.wminfo.subsystem != SDL_SYSWM_WAYLAND)
-          handleMouseGrabbed(event->motion.xrel, event->motion.yrel);
-      }
-      else
-        handleMouseNormal(event->motion.xrel, event->motion.yrel);
-      break;
-    }
-
-    case SDL_KEYDOWN:
-    {
-      SDL_Scancode sc = event->key.keysym.scancode;
-      if (sc == params.escapeKey && !g_state.escapeActive)
-      {
-        g_state.escapeActive = true;
-        g_state.escapeAction = -1;
-        break;
-      }
-
-      if (g_state.escapeActive)
-      {
-        g_state.escapeAction = sc;
-        break;
-      }
-
-      if (!inputEnabled())
-        break;
-
-      if (params.ignoreWindowsKeys &&
-          (sc == SDL_SCANCODE_LGUI || sc == SDL_SCANCODE_RGUI))
-        break;
-
-
-      uint32_t scancode = mapScancode(sc);
-      if (scancode == 0)
-        break;
-
-      if (!g_state.keyDown[sc])
-      {
-        if (spice_key_down(scancode))
-          g_state.keyDown[sc] = true;
-        else
-        {
-          DEBUG_ERROR("SDL_KEYDOWN: failed to send message");
-          break;
-        }
-      }
-      break;
-    }
-
-    case SDL_KEYUP:
-    {
-      SDL_Scancode sc = event->key.keysym.scancode;
-      if (g_state.escapeActive)
-      {
-        if (g_state.escapeAction == -1)
-        {
-          if (params.useSpiceInput)
-            setGrab(!g_cursor.grab);
-        }
-        else
-        {
-          KeybindHandle handle = g_state.bindings[sc];
-          if (handle)
-          {
-            handle->callback(sc, handle->opaque);
-            break;
-          }
-        }
-
-        if (sc == params.escapeKey)
-          g_state.escapeActive = false;
-      }
-
-      if (!inputEnabled())
-        break;
-
-      // avoid sending key up events when we didn't send a down
-      if (!g_state.keyDown[sc])
-        break;
-
-      if (params.ignoreWindowsKeys &&
-          (sc == SDL_SCANCODE_LGUI || sc == SDL_SCANCODE_RGUI))
-        break;
-
-      uint32_t scancode = mapScancode(sc);
-      if (scancode == 0)
-        break;
-
-      if (spice_key_up(scancode))
-        g_state.keyDown[sc] = false;
-      else
-      {
-        DEBUG_ERROR("SDL_KEYUP: failed to send message");
-        break;
-      }
-      break;
-    }
-
-    case SDL_MOUSEWHEEL:
-      if (!inputEnabled() || !g_cursor.inView)
-        break;
-
-      if (
-        !spice_mouse_press  (event->wheel.y > 0 ? 4 : 5) ||
-        !spice_mouse_release(event->wheel.y > 0 ? 4 : 5)
-        )
-      {
-        DEBUG_ERROR("SDL_MOUSEWHEEL: failed to send messages");
-        break;
-      }
-      break;
-
-    case SDL_MOUSEBUTTONDOWN:
-    {
-      if (!inputEnabled() || !g_cursor.inView)
-        break;
-
-      int button = event->button.button;
-      if (button > 3)
-        button += 2;
-
-      if (!spice_mouse_press(button))
-      {
-        DEBUG_ERROR("SDL_MOUSEBUTTONDOWN: failed to send message");
-        break;
-      }
-      break;
-    }
-
-    case SDL_MOUSEBUTTONUP:
-    {
-      if (!inputEnabled() || !g_cursor.inView)
-        break;
-
-      int button = event->button.button;
-      if (button > 3)
-        button += 2;
-
-      if (!spice_mouse_release(button))
-      {
-        DEBUG_ERROR("SDL_MOUSEBUTTONUP: failed to send message");
-        break;
-      }
-      break;
-    }
-  }
-
   // consume all events
   return 0;
 }
 
-void int_handler(int signal)
+void int_handler(int sig)
 {
-  switch(signal)
+  switch(sig)
   {
     case SIGINT:
     case SIGTERM:
-      DEBUG_INFO("Caught signal, shutting down...");
-      g_state.state = APP_STATE_SHUTDOWN;
+      if (g_state.state != APP_STATE_SHUTDOWN)
+      {
+        DEBUG_INFO("Caught signal, shutting down...");
+        g_state.state = APP_STATE_SHUTDOWN;
+      }
+      else
+      {
+        DEBUG_INFO("Caught second signal, force quitting...");
+        signal(sig, SIG_DFL);
+        raise(sig);
+      }
       break;
   }
 }
@@ -1675,13 +1653,13 @@ static bool try_renderer(const int index, const LG_RendererParams lgrParams, Uin
   return true;
 }
 
-static void toggle_fullscreen(SDL_Scancode key, void * opaque)
+static void toggle_fullscreen(uint32_t scancode, void * opaque)
 {
   SDL_SetWindowFullscreen(g_state.window, params.fullscreen ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
   params.fullscreen = !params.fullscreen;
 }
 
-static void toggle_video(SDL_Scancode key, void * opaque)
+static void toggle_video(uint32_t scancode, void * opaque)
 {
   g_state.stopVideo = !g_state.stopVideo;
   app_alert(
@@ -1702,21 +1680,36 @@ static void toggle_video(SDL_Scancode key, void * opaque)
   }
 }
 
-static void toggle_input(SDL_Scancode key, void * opaque)
+static void toggle_rotate(uint32_t scancode, void * opaque)
+{
+  if (params.winRotate == LG_ROTATE_MAX-1)
+    params.winRotate = 0;
+  else
+    ++params.winRotate;
+  updatePositionInfo();
+}
+
+static void toggle_input(uint32_t scancode, void * opaque)
 {
   g_state.ignoreInput = !g_state.ignoreInput;
+
+  if (g_state.ignoreInput)
+    setCursorInView(false);
+  else
+    g_state.ds->realignPointer();
+
   app_alert(
     LG_ALERT_INFO,
     g_state.ignoreInput ? "Input Disabled" : "Input Enabled"
   );
 }
 
-static void quit(SDL_Scancode key, void * opaque)
+static void quit(uint32_t scancode, void * opaque)
 {
   g_state.state = APP_STATE_SHUTDOWN;
 }
 
-static void mouse_sens_inc(SDL_Scancode key, void * opaque)
+static void mouse_sens_inc(uint32_t scancode, void * opaque)
 {
   char * msg;
   if (g_cursor.sens < 9)
@@ -1730,7 +1723,7 @@ static void mouse_sens_inc(SDL_Scancode key, void * opaque)
   free(msg);
 }
 
-static void mouse_sens_dec(SDL_Scancode key, void * opaque)
+static void mouse_sens_dec(uint32_t scancode, void * opaque)
 {
   char * msg;
 
@@ -1745,12 +1738,11 @@ static void mouse_sens_dec(SDL_Scancode key, void * opaque)
   free(msg);
 }
 
-static void ctrl_alt_fn(SDL_Scancode key, void * opaque)
+static void ctrl_alt_fn(uint32_t key, void * opaque)
 {
-  const uint32_t ctrl = mapScancode(SDL_SCANCODE_LCTRL);
-  const uint32_t alt  = mapScancode(SDL_SCANCODE_LALT );
-  const uint32_t fn   = mapScancode(key);
-
+  const uint32_t ctrl = xfree86_to_ps2[KEY_LEFTCTRL];
+  const uint32_t alt  = xfree86_to_ps2[KEY_LEFTALT ];
+  const uint32_t fn   = xfree86_to_ps2[key];
   spice_key_down(ctrl);
   spice_key_down(alt );
   spice_key_down(fn  );
@@ -1760,40 +1752,45 @@ static void ctrl_alt_fn(SDL_Scancode key, void * opaque)
   spice_key_up(fn  );
 }
 
-static void key_passthrough(SDL_Scancode key, void * opaque)
+static void key_passthrough(uint32_t sc, void * opaque)
 {
-  const uint32_t sc = mapScancode(key);
+  sc = xfree86_to_ps2[sc];
   spice_key_down(sc);
   spice_key_up  (sc);
 }
 
-static void register_key_binds()
+static void register_key_binds(void)
 {
-  g_state.kbFS           = app_register_keybind(SDL_SCANCODE_F     , toggle_fullscreen, NULL);
-  g_state.kbVideo        = app_register_keybind(SDL_SCANCODE_V     , toggle_video     , NULL);
-  g_state.kbInput        = app_register_keybind(SDL_SCANCODE_I     , toggle_input     , NULL);
-  g_state.kbQuit         = app_register_keybind(SDL_SCANCODE_Q     , quit             , NULL);
-  g_state.kbMouseSensInc = app_register_keybind(SDL_SCANCODE_INSERT, mouse_sens_inc   , NULL);
-  g_state.kbMouseSensDec = app_register_keybind(SDL_SCANCODE_DELETE, mouse_sens_dec   , NULL);
+  g_state.kbFS           = app_register_keybind(KEY_F     , toggle_fullscreen, NULL);
+  g_state.kbVideo        = app_register_keybind(KEY_V     , toggle_video     , NULL);
+  g_state.kbRotate       = app_register_keybind(KEY_R     , toggle_rotate    , NULL);
+  g_state.kbQuit         = app_register_keybind(KEY_Q     , quit             , NULL);
 
-  g_state.kbCtrlAltFn[0 ] = app_register_keybind(SDL_SCANCODE_F1 , ctrl_alt_fn, NULL);
-  g_state.kbCtrlAltFn[1 ] = app_register_keybind(SDL_SCANCODE_F2 , ctrl_alt_fn, NULL);
-  g_state.kbCtrlAltFn[2 ] = app_register_keybind(SDL_SCANCODE_F3 , ctrl_alt_fn, NULL);
-  g_state.kbCtrlAltFn[3 ] = app_register_keybind(SDL_SCANCODE_F4 , ctrl_alt_fn, NULL);
-  g_state.kbCtrlAltFn[4 ] = app_register_keybind(SDL_SCANCODE_F5 , ctrl_alt_fn, NULL);
-  g_state.kbCtrlAltFn[5 ] = app_register_keybind(SDL_SCANCODE_F6 , ctrl_alt_fn, NULL);
-  g_state.kbCtrlAltFn[6 ] = app_register_keybind(SDL_SCANCODE_F7 , ctrl_alt_fn, NULL);
-  g_state.kbCtrlAltFn[7 ] = app_register_keybind(SDL_SCANCODE_F8 , ctrl_alt_fn, NULL);
-  g_state.kbCtrlAltFn[8 ] = app_register_keybind(SDL_SCANCODE_F9 , ctrl_alt_fn, NULL);
-  g_state.kbCtrlAltFn[9 ] = app_register_keybind(SDL_SCANCODE_F10, ctrl_alt_fn, NULL);
-  g_state.kbCtrlAltFn[10] = app_register_keybind(SDL_SCANCODE_F11, ctrl_alt_fn, NULL);
-  g_state.kbCtrlAltFn[11] = app_register_keybind(SDL_SCANCODE_F12, ctrl_alt_fn, NULL);
+  if (params.useSpiceInput)
+  {
+    g_state.kbInput        = app_register_keybind(KEY_I     , toggle_input     , NULL);
+    g_state.kbMouseSensInc = app_register_keybind(KEY_INSERT, mouse_sens_inc   , NULL);
+    g_state.kbMouseSensDec = app_register_keybind(KEY_DELETE, mouse_sens_dec   , NULL);
 
-  g_state.kbPass[0] = app_register_keybind(SDL_SCANCODE_LGUI, key_passthrough, NULL);
-  g_state.kbPass[1] = app_register_keybind(SDL_SCANCODE_RGUI, key_passthrough, NULL);
+    g_state.kbCtrlAltFn[0 ] = app_register_keybind(KEY_F1 , ctrl_alt_fn, NULL);
+    g_state.kbCtrlAltFn[1 ] = app_register_keybind(KEY_F2 , ctrl_alt_fn, NULL);
+    g_state.kbCtrlAltFn[2 ] = app_register_keybind(KEY_F3 , ctrl_alt_fn, NULL);
+    g_state.kbCtrlAltFn[3 ] = app_register_keybind(KEY_F4 , ctrl_alt_fn, NULL);
+    g_state.kbCtrlAltFn[4 ] = app_register_keybind(KEY_F5 , ctrl_alt_fn, NULL);
+    g_state.kbCtrlAltFn[5 ] = app_register_keybind(KEY_F6 , ctrl_alt_fn, NULL);
+    g_state.kbCtrlAltFn[6 ] = app_register_keybind(KEY_F7 , ctrl_alt_fn, NULL);
+    g_state.kbCtrlAltFn[7 ] = app_register_keybind(KEY_F8 , ctrl_alt_fn, NULL);
+    g_state.kbCtrlAltFn[8 ] = app_register_keybind(KEY_F9 , ctrl_alt_fn, NULL);
+    g_state.kbCtrlAltFn[9 ] = app_register_keybind(KEY_F10, ctrl_alt_fn, NULL);
+    g_state.kbCtrlAltFn[10] = app_register_keybind(KEY_F11, ctrl_alt_fn, NULL);
+    g_state.kbCtrlAltFn[11] = app_register_keybind(KEY_F12, ctrl_alt_fn, NULL);
+
+    g_state.kbPass[0] = app_register_keybind(KEY_LEFTMETA , key_passthrough, NULL);
+    g_state.kbPass[1] = app_register_keybind(KEY_RIGHTMETA, key_passthrough, NULL);
+  }
 }
 
-static void release_key_binds()
+static void release_key_binds(void)
 {
   app_release_keybind(&g_state.kbFS   );
   app_release_keybind(&g_state.kbVideo);
@@ -1807,7 +1804,7 @@ static void release_key_binds()
     app_release_keybind(&g_state.kbPass[i]);
 }
 
-static void initSDLCursor()
+static void initSDLCursor(void)
 {
   const uint8_t data[4] = {0xf, 0x9, 0x9, 0xf};
   const uint8_t mask[4] = {0xf, 0xf, 0xf, 0xf};
@@ -1815,33 +1812,62 @@ static void initSDLCursor()
   SDL_SetCursor(cursor);
 }
 
-static int lg_run()
+static int lg_run(void)
 {
   memset(&g_state, 0, sizeof(g_state));
-
-  lgInit();
 
   g_cursor.sens = params.mouseSens;
        if (g_cursor.sens < -9) g_cursor.sens = -9;
   else if (g_cursor.sens >  9) g_cursor.sens =  9;
 
-  if (getenv("WAYLAND_DISPLAY"))
+  // try to early detect the platform
+  SDL_SYSWM_TYPE subsystem = SDL_SYSWM_UNKNOWN;
+       if (getenv("WAYLAND_DISPLAY")) subsystem = SDL_SYSWM_WAYLAND;
+  else if (getenv("DISPLAY"        )) subsystem = SDL_SYSWM_X11;
+  else
+    DEBUG_WARN("Unknown subsystem, falling back to SDL default");
+
+  // search for the best displayserver ops to use
+  for(int i = 0; i < LG_DISPLAYSERVER_COUNT; ++i)
+    if (LG_DisplayServers[i]->subsystem == subsystem)
+    {
+      g_state.ds = LG_DisplayServers[i];
+      break;
+    }
+
+  assert(g_state.ds);
+
+  // set any null methods to the fallback
+#define SET_FALLBACK(x) \
+  if (!g_state.ds->x) g_state.ds->x = LG_DisplayServers[0]->x;
+  SET_FALLBACK(earlyInit);
+  SET_FALLBACK(getProp);
+  SET_FALLBACK(init);
+  SET_FALLBACK(startup);
+  SET_FALLBACK(shutdown);
+  SET_FALLBACK(free);
+  SET_FALLBACK(eventFilter);
+  SET_FALLBACK(grabPointer);
+  SET_FALLBACK(ungrabKeyboard);
+  SET_FALLBACK(warpPointer);
+  SET_FALLBACK(realignPointer);
+  SET_FALLBACK(inhibitIdle);
+  SET_FALLBACK(uninhibitIdle);
+  SET_FALLBACK(cbInit);
+  SET_FALLBACK(cbNotice);
+  SET_FALLBACK(cbRelease);
+  SET_FALLBACK(cbRequest);
+#undef SET_FALLBACK
+
+  // init the subsystem
+  if (!g_state.ds->earlyInit())
   {
-     DEBUG_INFO("Wayland detected");
-     if (getenv("SDL_VIDEODRIVER") == NULL)
-     {
-       int err = setenv("SDL_VIDEODRIVER", "wayland", 1);
-       if (err < 0)
-       {
-         DEBUG_ERROR("Unable to set the env variable SDL_VIDEODRIVER: %d", err);
-         return -1;
-       }
-       DEBUG_INFO("SDL_VIDEODRIVER has been set to wayland");
-     }
+    DEBUG_ERROR("Subsystem early init failed");
+    return -1;
   }
 
-  if (!params.noScreensaver)
-    SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
+  // Allow screensavers for now: we will enable and disable as needed.
+  SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
 
   if (SDL_Init(SDL_INIT_VIDEO) < 0)
   {
@@ -1937,7 +1963,7 @@ static int lg_run()
     params.w,
     params.h,
     (
-      SDL_WINDOW_SHOWN |
+      SDL_WINDOW_HIDDEN |
       (params.allowResize ? SDL_WINDOW_RESIZABLE  : 0) |
       (params.borderless  ? SDL_WINDOW_BORDERLESS : 0) |
       (params.maximize    ? SDL_WINDOW_MAXIMIZED  : 0) |
@@ -1951,6 +1977,22 @@ static int lg_run()
     return 1;
   }
 
+  SDL_VERSION(&g_state.wminfo.version);
+  if (!SDL_GetWindowWMInfo(g_state.window, &g_state.wminfo))
+  {
+    DEBUG_ERROR("Could not get SDL window information %s", SDL_GetError());
+    return -1;
+  }
+
+  // enable WM events
+  SDL_EventState(SDL_SYSWMEVENT, SDL_ENABLE);
+
+  g_state.ds->init(&g_state.wminfo);
+
+  // now init has been done we can show the window, doing this before init for
+  // X11 causes us to miss the first focus event
+  SDL_ShowWindow(g_state.window);
+
   SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS,
       params.minimizeOnFocusLoss ? "1" : "0");
 
@@ -1959,6 +2001,9 @@ static int lg_run()
 
   if (!params.center)
     SDL_SetWindowPosition(g_state.window, params.x, params.y);
+
+  if (params.noScreensaver)
+    g_state.ds->inhibitIdle();
 
   // ensure the initial window size is stored in the state
   SDL_GetWindowSize(g_state.window, &g_state.windowW, &g_state.windowH);
@@ -1982,59 +2027,7 @@ static int lg_run()
 
   register_key_binds();
 
-  // set the compositor hint to bypass for low latency
-  SDL_VERSION(&g_state.wminfo.version);
-  if (SDL_GetWindowWMInfo(g_state.window, &g_state.wminfo))
-  {
-    if (g_state.wminfo.subsystem == SDL_SYSWM_X11)
-    {
-      int event, error;
-
-      // enable X11 events to work around SDL2 bugs
-      SDL_EventState(SDL_SYSWMEVENT, SDL_ENABLE);
-
-      XQueryExtension(g_state.wminfo.info.x11.display, "XInputExtension",
-          &g_XInputOp, &event, &error);
-
-      Atom NETWM_BYPASS_COMPOSITOR = XInternAtom(
-        g_state.wminfo.info.x11.display,
-        "NETWM_BYPASS_COMPOSITOR",
-        False);
-
-      unsigned long value = 1;
-      XChangeProperty(
-        g_state.wminfo.info.x11.display,
-        g_state.wminfo.info.x11.window,
-        NETWM_BYPASS_COMPOSITOR,
-        XA_CARDINAL,
-        32,
-        PropModeReplace,
-        (unsigned char *)&value,
-        1
-      );
-
-      g_state.lgc = LG_Clipboards[0];
-    }
-  } else {
-    DEBUG_ERROR("Could not get SDL window information %s", SDL_GetError());
-    return -1;
-  }
-
-  if (g_state.lgc)
-  {
-    DEBUG_INFO("Using Clipboard: %s", g_state.lgc->getName());
-    if (!g_state.lgc->init(&g_state.wminfo, clipboardRelease, clipboardNotify, clipboardData))
-    {
-      DEBUG_WARN("Failed to initialize the clipboard interface, continuing anyway");
-      g_state.lgc = NULL;
-    }
-
-    g_state.cbRequestList = ll_new();
-  }
-
   initSDLCursor();
-  if (params.hideMouse)
-    SDL_ShowCursor(SDL_DISABLE);
 
   // setup the startup condition
   if (!(e_startup = lgCreateEvent(false, 0)))
@@ -2049,6 +2042,8 @@ static int lg_run()
     DEBUG_ERROR("failed to create the frame event");
     return -1;
   }
+
+  lgInit();
 
   // start the renderThread so we don't just display junk
   if (!lgCreateThread("renderThread", renderThread, NULL, &t_render))
@@ -2065,7 +2060,10 @@ static int lg_run()
   // the end of the output
   lgWaitEvent(e_startup, TIMEOUT_INFINITE);
 
-  wmInit();
+  g_state.ds->startup();
+  g_state.cbAvailable = g_state.ds->cbInit && g_state.ds->cbInit();
+  if (g_state.cbAvailable)
+    g_state.cbRequestList = ll_new();
 
   LGMP_STATUS status;
 
@@ -2112,7 +2110,8 @@ restart:
     {
       DEBUG_BREAK();
       DEBUG_INFO("Please check the host application is running and is the correct version");
-      DEBUG_INFO("Check the host log in your guest at %%TEMP%%\\looking-glass-host.txt");
+      DEBUG_INFO("Check the host log in your guest at: "
+        "%%ProgramData%%\\Looking Glass (host)\\looking-glass-host.txt");
       DEBUG_INFO("Continuing to wait...");
     }
 
@@ -2205,7 +2204,7 @@ restart:
   return 0;
 }
 
-static void lg_shutdown()
+static void lg_shutdown(void)
 {
   g_state.state = APP_STATE_SHUTDOWN;
   if (t_render)
@@ -2232,13 +2231,10 @@ static void lg_shutdown()
   // if spice is still connected send key up events for any pressed keys
   if (params.useSpiceInput && spice_ready())
   {
-    for(int i = 0; i < SDL_NUM_SCANCODES; ++i)
-      if (g_state.keyDown[i])
+    for(uint32_t scancode = 0; scancode < KEY_MAX; ++scancode)
+      if (g_state.keyDown[scancode])
       {
-        uint32_t scancode = mapScancode(i);
-        if (scancode == 0)
-          continue;
-        g_state.keyDown[i] = false;
+        g_state.keyDown[scancode] = false;
         spice_key_up(scancode);
       }
 
@@ -2247,19 +2243,18 @@ static void lg_shutdown()
       lgJoinThread(t_spice, NULL);
   }
 
-  if (g_state.lgc)
-  {
-    g_state.lgc->free();
+  if (g_state.ds)
+    g_state.ds->shutdown();
 
-    struct CBRequest *cbr;
-    while(ll_shift(g_state.cbRequestList, (void **)&cbr))
-      free(cbr);
+  if (g_state.cbRequestList)
+  {
     ll_free(g_state.cbRequestList);
+    g_state.cbRequestList = NULL;
   }
 
   if (g_state.window)
   {
-    wmFree();
+    g_state.ds->free();
     SDL_DestroyWindow(g_state.window);
   }
 

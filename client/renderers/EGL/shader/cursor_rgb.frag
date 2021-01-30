@@ -5,6 +5,7 @@ out highp vec4 color;
 
 uniform sampler2D sampler1;
 
+uniform lowp int rotate;
 uniform int cbMode;
 
 void main()

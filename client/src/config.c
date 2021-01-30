@@ -27,6 +27,10 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <pwd.h>
 #include <unistd.h>
 
+//FIXME: this should really not be included here and is an ugly hack to retain
+//backwards compatibility with the escape key scancode
+extern uint32_t sdl_to_xfree86[];
+
 // forwards
 static bool       optRendererParse   (struct Option * opt, const char * str);
 static StringList optRendererValues  (struct Option * opt);
@@ -38,6 +42,7 @@ static bool       optSizeParse       (struct Option * opt, const char * str);
 static StringList optSizeValues      (struct Option * opt);
 static char *     optSizeToString    (struct Option * opt);
 static char *     optScancodeToString(struct Option * opt);
+static bool       optRotateValidate  (struct Option * opt, const char ** error);
 
 static void doLicense();
 
@@ -234,6 +239,14 @@ static struct Option options[] =
     .type           = OPTION_TYPE_BOOL,
     .value.x_bool   = false,
   },
+  {
+    .module         = "win",
+    .name           = "rotate",
+    .description    = "Rotate the displayed image (0, 90, 180, 270)",
+    .type           = OPTION_TYPE_INT,
+    .validator      = optRotateValidate,
+    .value.x_int    = 0,
+  },
 
   // input options
   {
@@ -396,7 +409,7 @@ static struct Option options[] =
   {0}
 };
 
-void config_init()
+void config_init(void)
 {
   params.center = true;
   params.w      = 1024;
@@ -475,6 +488,14 @@ bool config_load(int argc, char * argv[])
   params.showAlerts    = option_get_bool  ("win", "alerts"       );
   params.quickSplash   = option_get_bool  ("win", "quickSplash"  );
 
+  switch(option_get_int("win", "rotate"))
+  {
+    case 0  : params.winRotate = LG_ROTATE_0  ; break;
+    case 90 : params.winRotate = LG_ROTATE_90 ; break;
+    case 180: params.winRotate = LG_ROTATE_180; break;
+    case 270: params.winRotate = LG_ROTATE_270; break;
+  }
+
   params.grabKeyboard        = option_get_bool("input", "grabKeyboard"       );
   params.grabKeyboardOnFocus = option_get_bool("input", "grabKeyboardOnFocus");
   params.escapeKey           = option_get_int ("input", "escapeKey"          );
@@ -511,15 +532,18 @@ bool config_load(int argc, char * argv[])
     params.alwaysShowCursor  = option_get_bool("spice", "alwaysShowCursor");
   }
 
+  //FIXME, this should be using linux keycodes
+  params.escapeKey = sdl_to_xfree86[params.escapeKey];
+
   return true;
 }
 
-void config_free()
+void config_free(void)
 {
   option_free();
 }
 
-static void doLicense()
+static void doLicense(void)
 {
   fprintf(stderr,
     "\n"
@@ -661,6 +685,22 @@ static char * optSizeToString(struct Option * opt)
 static char * optScancodeToString(struct Option * opt)
 {
   char * str;
-  alloc_sprintf(&str, "%d = %s", opt->value.x_int, SDL_GetScancodeName(opt->value.x_int));
+  alloc_sprintf(&str, "%d = %s", opt->value.x_int,
+      SDL_GetScancodeName(opt->value.x_int));
   return str;
+}
+
+static bool optRotateValidate(struct Option * opt, const char ** error)
+{
+  switch(opt->value.x_int)
+  {
+    case   0:
+    case  90:
+    case 180:
+    case 270:
+      return true;
+  }
+
+  *error = "Rotation angle must be one of 0, 90, 180 or 270";
+  return false;
 }

@@ -17,18 +17,20 @@ this program; if not, write to the Free Software Foundation, Inc., 59 Temple
 Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
-#define INSTANCE_MUTEX_NAME "Global\\6f1a5eec-af3f-4a65-99dd-ebe0e4ecea55"
-
 #include "interface/platform.h"
 #include "common/ivshmem.h"
+#include "service.h"
+#include "platform.h"
 
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <time.h>
 
 #include <windows.h>
+#include <shlwapi.h>
 #include <winsvc.h>
 #include <psapi.h>
 #include <sddl.h>
@@ -37,6 +39,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 
 #define SVCNAME   "Looking Glass (host)"
 #define SVC_ERROR ((DWORD)0xC0020001L)
+#define LOG_NAME  "looking-glass-host-service.txt"
 
 /*
  * Windows 10 provides this API via kernel32.dll as well as advapi32.dll and
@@ -59,13 +62,22 @@ static CreateProcessAsUserA_t f_CreateProcessAsUserA = NULL;
 struct Service
 {
   FILE * logFile;
-  bool  running;
-  DWORD processId;
+  bool   running;
+  HANDLE process;
 };
 
 struct Service service = { 0 };
 
-void doLog(const char * fmt, ...)
+char logTime[100];
+
+char * currentTime()
+{
+  time_t t = time(NULL);
+  strftime(logTime, sizeof logTime, "%Y-%m-%d %H:%M:%S", localtime(&t));
+  return logTime;
+}
+
+void doLogReal(const char * fmt, ...)
 {
   va_list args;
   va_start(args, fmt);
@@ -73,7 +85,9 @@ void doLog(const char * fmt, ...)
   va_end(args);
 }
 
-static bool setupAPI()
+#define doLog(fmt, ...) doLogReal("[%s] " fmt, currentTime(), ##__VA_ARGS__)
+
+static bool setupAPI(void)
 {
   /* first look in kernel32.dll */
   HMODULE mod;
@@ -99,24 +113,23 @@ static bool setupAPI()
   return false;
 }
 
-static void setupLogging()
+static void setupLogging(void)
 {
-  char tempPath[MAX_PATH+1];
-  GetTempPathA(sizeof(tempPath), tempPath);
-  int len = snprintf(NULL, 0, "%slooking-glass-host-service.txt", tempPath);
-  char * logFilePath = malloc(len + 1);
-  sprintf(logFilePath, "%slooking-glass-host-service.txt", tempPath);
+  char logFilePath[MAX_PATH];
+  if (!PathCombineA(logFilePath, getSystemLogDirectory(), LOG_NAME))
+    strcpy(logFilePath, LOG_NAME);
   service.logFile = fopen(logFilePath, "a+");
+  setbuf(service.logFile, NULL);
   doLog("Startup\n");
 }
 
-static void finishLogging()
+static void finishLogging(void)
 {
   doLog("Finished\n");
   fclose(service.logFile);
 }
 
-void winerr()
+void winerr(void)
 {
   char buf[256];
   FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -165,6 +178,7 @@ bool enablePriv(const char * name)
     goto fail;
   }
 
+  CloseHandle(hToken);
   return true;
 
 fail:
@@ -172,7 +186,7 @@ fail:
   return false;
 }
 
-HANDLE dupeSystemProcessToken()
+HANDLE dupeSystemProcessToken(void)
 {
   DWORD count = 0;
   DWORD returned;
@@ -235,31 +249,14 @@ err_proc:
   return NULL;
 }
 
-DWORD GetInteractiveSessionID()
+void Launch(void)
 {
-  PWTS_SESSION_INFO pSessionInfo;
-  DWORD count;
-  DWORD ret = 0;
-
-  if (!WTSEnumerateSessions(WTS_CURRENT_SERVER_HANDLE, 0, 1, &pSessionInfo,
-        &count))
-    return 0;
-
-  for(DWORD i = 0; i < count; ++i)
+  if (service.process)
   {
-    if (pSessionInfo[i].State == WTSActive)
-    {
-      ret = pSessionInfo[i].SessionId;
-      break;
-    }
+    CloseHandle(service.process);
+    service.process = NULL;
   }
 
-  WTSFreeMemory(pSessionInfo);
-  return ret;
-}
-
-void Launch()
-{
   if (!setupAPI())
   {
     doLog("setupAPI failed\n");
@@ -283,7 +280,7 @@ void Launch()
   if (!enablePriv(SE_TCB_NAME))
     goto fail_token;
 
-  targetSessionID = GetInteractiveSessionID();
+  targetSessionID = WTSGetActiveConsoleSessionId();
   if (origSessionID != targetSessionID)
   {
     if (!SetTokenInformation(hToken, TokenSessionId,
@@ -299,16 +296,6 @@ void Launch()
   if (!CreateEnvironmentBlock(&pEnvironment, hToken, TRUE))
   {
     doLog("fail_tokened to create the envionment block\n");
-    winerr();
-    goto fail_token;
-  }
-
-  if (!enablePriv(SE_IMPERSONATE_NAME))
-    goto fail_token;
-
-  if (!ImpersonateLoggedOnUser(hToken))
-  {
-    doLog("fail_tokened to impersonate\n");
     winerr();
     goto fail_token;
   }
@@ -332,11 +319,10 @@ void Launch()
     .lpDesktop   = "WinSta0\\Default"
   };
 
-  char * exe = strdup(os_getExecutable());
   if (!f_CreateProcessAsUserA(
       hToken,
+      os_getExecutable(),
       NULL,
-      exe,
       NULL,
       NULL,
       TRUE,
@@ -350,14 +336,12 @@ void Launch()
     service.running = false;
     doLog("failed to launch\n");
     winerr();
-    goto fail_exe;
+    goto fail_token;
   }
 
-  service.processId = pi.dwProcessId;
-  service.running   = true;
-
-fail_exe:
-  free(exe);
+  CloseHandle(pi.hThread);
+  service.process = pi.hProcess;
+  service.running = true;
 
 fail_token:
   CloseHandle(hToken);
@@ -392,7 +376,7 @@ VOID SvcReportEvent(LPTSTR szFunction)
   }
 }
 
-void Install()
+void Install(void)
 {
   TCHAR szPath[MAX_PATH];
 
@@ -488,7 +472,7 @@ void Install()
   CloseServiceHandle(schSCManager);
 }
 
-void Uninstall()
+void Uninstall(void)
 {
   SC_HANDLE schSCManager;
   SC_HANDLE schService;
@@ -662,48 +646,89 @@ VOID WINAPI SvcMain(DWORD dwArgc, LPTSTR *lpszArgv)
   ReportSvcStatus(SERVICE_RUNNING, NO_ERROR, 0);
   while(1)
   {
-    /* check if the app is running by trying to take the lock */
-    bool running = true;
-    HANDLE m = CreateMutex(NULL, FALSE, INSTANCE_MUTEX_NAME);
-    if (WaitForSingleObject(m, 0) == WAIT_OBJECT_0)
-    {
-      running = false;
-      service.running = false;
-      ReleaseMutex(m);
-    }
-    CloseHandle(m);
+    ULONGLONG launchTime = 0ULL;
 
-    if (!running && GetInteractiveSessionID() != 0)
+    DWORD interactiveSession = WTSGetActiveConsoleSessionId();
+    if (interactiveSession != 0 && interactiveSession != 0xFFFFFFFF)
     {
       Launch();
-      /* avoid being overly agressive in restarting */
-      Sleep(1);
+      launchTime = GetTickCount64();
     }
 
-    if (WaitForSingleObject(ghSvcStopEvent, 100) == WAIT_OBJECT_0)
-      break;
+    HANDLE waitOn[] = { ghSvcStopEvent, service.process };
+    DWORD count = 2;
+    DWORD duration = INFINITE;
+
+    if (!service.running)
+    {
+      // If the service is running, wait only on ghSvcStopEvent and prepare to restart in one second.
+      count = 1;
+      duration = 1000;
+    }
+
+    switch (WaitForMultipleObjects(count, waitOn, FALSE, duration))
+    {
+      case WAIT_OBJECT_0:
+        goto stopped;
+
+      case WAIT_OBJECT_0 + 1:
+      {
+        service.running = false;
+
+        DWORD code;
+        if (!GetExitCodeProcess(service.process, &code))
+          doLog("Failed to GetExitCodeProcess (0x%lx)\n", GetLastError());
+        else
+        {
+          doLog("Host application exited with code 0x%lx\n", code);
+          switch (code)
+          {
+            case LG_HOST_EXIT_USER:
+              doLog("Host application exited due to user action\n");
+              goto stopped;
+
+            case LG_HOST_EXIT_CAPTURE:
+              doLog("Host application exited due to capture error; restarting\n");
+              break;
+
+            case LG_HOST_EXIT_KILLED:
+              doLog("Host application was killed; restarting\n");
+              break;
+
+            case LG_HOST_EXIT_FAILED:
+              doLog("Host application failed to start; will not restart\n");
+              goto stopped;
+
+            default:
+              doLog("Host application failed due to unknown error; restarting\n");
+              break;
+          }
+        }
+
+        // avoid restarting too often
+        if (GetTickCount64() - launchTime < 1000)
+          Sleep(1000);
+        break;
+      }
+
+      case WAIT_FAILED:
+        doLog("Failed to WaitForMultipleObjects (0x%lx)\n", GetLastError());
+    }
   }
 
+  stopped:
   if (service.running)
   {
     doLog("Terminating the host application\n");
-    HANDLE proc = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, TRUE,
-        service.processId);
-    if (proc)
+    if (TerminateProcess(service.process, LG_HOST_EXIT_KILLED))
     {
-      if (TerminateProcess(proc, 0))
-      {
-        while(WaitForSingleObject(proc, INFINITE) != WAIT_OBJECT_0) {}
-        doLog("Host application terminated\n");
-      }
-      else
-        doLog("Failed to terminate the host application\n");
-      CloseHandle(proc);
+      while(WaitForSingleObject(service.process, INFINITE) != WAIT_OBJECT_0) {}
+      doLog("Host application terminated\n");
     }
     else
-    {
-      doLog("OpenProcess failed (%0xlx)\n", GetLastError());
-    }
+      doLog("Failed to terminate the host application\n");
+    CloseHandle(service.process);
+    service.process = NULL;
   }
 
 shutdown:
@@ -737,14 +762,6 @@ bool HandleService(int argc, char * argv[])
 
   if (StartServiceCtrlDispatcher(DispatchTable))
     return true;
-
-  /* only allow one instance to run */
-  HANDLE m = CreateMutex(NULL, FALSE, INSTANCE_MUTEX_NAME);
-  if (WaitForSingleObject(m, 0) != WAIT_OBJECT_0)
-  {
-    CloseHandle(m);
-    return true;
-  }
 
   return false;
 }

@@ -9,7 +9,11 @@ add_library(platform_Windows STATIC
 	src/platform.c
 	src/service.c
 	src/mousehook.c
+	src/force_compose.c
 )
+
+# allow use of functions for Windows Vista or later
+add_definitions(-D _WIN32_WINNT=0x6000)
 
 add_subdirectory("capture")
 
@@ -28,6 +32,7 @@ target_link_libraries(platform_Windows
 	userenv
 	wtsapi32
 	psapi
+	shlwapi
 )
 
 target_include_directories(platform_Windows
