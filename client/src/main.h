@@ -1,6 +1,6 @@
 /*
 Looking Glass - KVM FrameRelay (KVMFR) Client
-Copyright (C) 2017-2019 Geoffrey McRae <geoff@hostfission.com>
+Copyright (C) 2017-2021 Geoffrey McRae <geoff@hostfission.com>
 https://looking-glass.hostfission.com
 
 This program is free software; you can redistribute it and/or modify it under
@@ -19,12 +19,13 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 
 #include <stdbool.h>
 #include <stdatomic.h>
-#include <SDL2/SDL.h>
 #include <linux/input.h>
 
-#include "interface/app.h"
 #include "dynamic/displayservers.h"
 #include "dynamic/renderers.h"
+
+#include "common/thread.h"
+#include "common/types.h"
 #include "common/ivshmem.h"
 
 #include "spice/spice.h"
@@ -42,22 +43,28 @@ struct AppState
   enum RunState state;
 
   struct LG_DisplayServerOps * ds;
+  bool                         dsInitialized;
 
   bool                 stopVideo;
   bool                 ignoreInput;
+  bool                 showFPS;
   bool                 escapeActive;
-  SDL_Scancode         escapeAction;
+  uint64_t             escapeTime;
+  int                  escapeAction;
+  bool                 escapeHelp;
   KeybindHandle        bindings[KEY_MAX];
+  const char *         keyDescription[KEY_MAX];
   bool                 keyDown[KEY_MAX];
 
   bool                 haveSrcSize;
-  SDL_Point            windowPos;
+  struct Point         windowPos;
   int                  windowW, windowH;
   int                  windowCX, windowCY;
+  double               windowScale;
   LG_RendererRotate    rotate;
   bool                 focused;
-  SDL_Rect             border;
-  SDL_Point            srcSize;
+  struct Border        border;
+  struct Point         srcSize;
   LG_RendererRect      dstRect;
   bool                 posInfoValid;
   bool                 alignToGuest;
@@ -72,14 +79,12 @@ struct AppState
   size_t               cbXfer;
   struct ll          * cbRequestList;
 
-  SDL_SysWMinfo        wminfo;
-  SDL_Window         * window;
-
   struct IVSHMEM       shm;
   PLGMPClient          lgmp;
   PLGMPClientQueue     frameQueue;
   PLGMPClientQueue     pointerQueue;
 
+  LGThread            * frameThread;
   bool                  formatValid;
   atomic_uint_least64_t frameTime;
   uint64_t              lastFrameTime;
@@ -91,15 +96,7 @@ struct AppState
   uint64_t resizeTimeout;
   bool     resizeDone;
 
-  KeybindHandle kbFS;
-  KeybindHandle kbVideo;
-  KeybindHandle kbRotate;
-  KeybindHandle kbInput;
-  KeybindHandle kbQuit;
-  KeybindHandle kbMouseSensInc;
-  KeybindHandle kbMouseSensDec;
-  KeybindHandle kbCtrlAltFn[12];
-  KeybindHandle kbPass[2];
+  bool     autoIdleInhibitState;
 };
 
 struct AppParams
@@ -109,6 +106,7 @@ struct AppParams
   bool              keepAspect;
   bool              forceAspect;
   bool              dontUpscale;
+  bool              shrinkOnUpscale;
   bool              borderless;
   bool              fullscreen;
   bool              maximize;
@@ -129,14 +127,17 @@ struct AppParams
   bool              hideMouse;
   bool              ignoreQuit;
   bool              noScreensaver;
+  bool              autoScreensaver;
   bool              grabKeyboard;
   bool              grabKeyboardOnFocus;
-  SDL_Scancode      escapeKey;
+  int               escapeKey;
   bool              ignoreWindowsKeys;
+  bool              releaseKeysOnFocusLoss;
   bool              showAlerts;
   bool              captureOnStart;
   bool              quickSplash;
   bool              alwaysShowCursor;
+  uint64_t          helpMenuDelayUs;
 
   unsigned int      cursorPollInterval;
   unsigned int      framePollInterval;
@@ -152,6 +153,7 @@ struct AppParams
   bool              rawMouse;
   bool              autoCapture;
   bool              captureInputOnly;
+  bool              showCursorDot;
 };
 
 struct CBRequest
@@ -163,9 +165,9 @@ struct CBRequest
 
 struct KeybindHandle
 {
-  SDL_Scancode   key;
-  SuperEventFn   callback;
-  void         * opaque;
+  int       sc;
+  KeybindFn callback;
+  void    * opaque;
 };
 
 enum WarpState
@@ -190,11 +192,6 @@ struct CursorInfo
 
   /* the DPI scaling of the guest */
   uint32_t dpiScale;
-};
-
-struct DoublePoint
-{
-  double x, y;
 };
 
 struct CursorState
@@ -249,8 +246,14 @@ struct CursorState
 
   /* the guest's cursor position */
   struct CursorInfo guest;
+
+  /* the projected position after move, for app_handleMouseBasic only */
+  struct Point projected;
 };
 
 // forwards
-extern struct AppState  g_state;
-extern struct AppParams params;
+extern struct AppState    g_state;
+extern struct CursorState g_cursor;
+extern struct AppParams   g_params;
+
+int main_frameThread(void * unused);

@@ -20,14 +20,12 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "interface/renderer.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 #include <unistd.h>
 #include <malloc.h>
 #include <math.h>
 
-#include <SDL2/SDL_ttf.h>
-
 #include <GL/gl.h>
-#include <GL/glu.h>
 #include <GL/glx.h>
 
 #include "common/debug.h"
@@ -48,17 +46,6 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 
 #define FADE_TIME 1000000
 
-static bool opengl_vsync_option_validator(struct Option * opt, const char ** error)
-{
-  if (opt->value.x_bool && getenv("WAYLAND_DISPLAY"))
-  {
-    DEBUG_WARN("Cannot disable vsync on Wayland, forcing opengl:vsync=off");
-    opt->value.x_bool = false;
-  }
-
-  return true;
-}
-
 static struct Option opengl_options[] =
 {
   {
@@ -74,7 +61,6 @@ static struct Option opengl_options[] =
     .description  = "Enable vsync",
     .type         = OPTION_TYPE_BOOL,
     .value.x_bool = false,
-    .validator    = &opengl_vsync_option_validator
   },
   {
     .module       = "opengl",
@@ -91,6 +77,20 @@ static struct Option opengl_options[] =
     .value.x_bool = true
   },
   {0}
+};
+
+struct IntPoint
+{
+  int x;
+  int y;
+};
+
+struct IntRect
+{
+  int x;
+  int y;
+  int w;
+  int h;
 };
 
 struct OpenGL_Options
@@ -121,9 +121,10 @@ struct Inst
   bool              renderStarted;
   bool              configured;
   bool              reconfigure;
-  SDL_GLContext     glContext;
+  LG_DSGLContext    glContext;
 
-  SDL_Point         window;
+  struct IntPoint   window;
+  float             uiScale;
   bool              frameUpdate;
 
   const LG_Font   * font;
@@ -161,8 +162,9 @@ struct Inst
   uint64_t          waitFadeTime;
   bool              waitDone;
 
+  bool              showFPS;
   bool              fpsTexture;
-  SDL_Rect          fpsRect;
+  struct IntRect    fpsRect;
 
   LG_Lock           mouseLock;
   LG_RendererCursor mouseCursor;
@@ -176,7 +178,7 @@ struct Inst
   bool              newShape;
   LG_RendererCursor mouseType;
   bool              mouseVisible;
-  SDL_Rect          mousePos;
+  struct IntRect    mousePos;
 };
 
 static bool _check_gl_error(unsigned int line, const char * name);
@@ -190,7 +192,7 @@ enum ConfigStatus
 };
 
 static void deconfigure(struct Inst * this);
-static enum ConfigStatus configure(struct Inst * this, SDL_Window *window);
+static enum ConfigStatus configure(struct Inst * this);
 static void update_mouse_shape(struct Inst * this, bool * newShape);
 static bool draw_frame(struct Inst * this);
 static void draw_mouse(struct Inst * this);
@@ -206,7 +208,8 @@ static void opengl_setup(void)
   option_register(opengl_options);
 }
 
-bool opengl_create(void ** opaque, const LG_RendererParams params)
+bool opengl_create(void ** opaque, const LG_RendererParams params,
+    bool * needsOpenGL)
 {
   // create our local storage
   *opaque = malloc(sizeof(struct Inst));
@@ -245,10 +248,11 @@ bool opengl_create(void ** opaque, const LG_RendererParams params)
 
   this->alerts = ll_new();
 
+  *needsOpenGL = true;
   return true;
 }
 
-bool opengl_initialize(void * opaque, Uint32 * sdlFlags)
+bool opengl_initialize(void * opaque)
 {
   struct Inst * this = (struct Inst *)opaque;
   if (!this)
@@ -256,14 +260,6 @@ bool opengl_initialize(void * opaque, Uint32 * sdlFlags)
 
   this->waiting  = true;
   this->waitDone = false;
-
-  *sdlFlags = SDL_WINDOW_OPENGL;
-  SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER      , 1);
-  SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1);
-  SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, 4);
-  SDL_GL_SetAttribute(SDL_GL_RED_SIZE          , 8);
-  SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE        , 8);
-  SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE         , 8);
   return true;
 }
 
@@ -287,7 +283,7 @@ void opengl_deinitialize(void * opaque)
 
   if (this->glContext)
   {
-    SDL_GL_DeleteContext(this->glContext);
+    app_glDeleteContext(this->glContext);
     this->glContext = NULL;
   }
 
@@ -316,22 +312,29 @@ void opengl_on_restart(void * opaque)
   this->waiting = true;
 }
 
-void opengl_on_resize(void * opaque, const int width, const int height,
+void opengl_on_resize(void * opaque, const int width, const int height, const double scale,
     const LG_RendererRect destRect, LG_RendererRotate rotate)
 {
   struct Inst * this = (struct Inst *)opaque;
 
-  this->window.x = width;
-  this->window.y = height;
+  this->window.x = width * scale;
+  this->window.y = height * scale;
+  this->uiScale  = (float) scale;
 
   if (destRect.valid)
-    memcpy(&this->destRect, &destRect, sizeof(LG_RendererRect));
+  {
+    this->destRect.valid = true;
+    this->destRect.x = destRect.x * scale;
+    this->destRect.y = destRect.y * scale;
+    this->destRect.w = destRect.w * scale;
+    this->destRect.h = destRect.h * scale;
+  }
 
   // setup the projection matrix
   glViewport(0, 0, this->window.x, this->window.y);
   glMatrixMode(GL_PROJECTION);
   glLoadIdentity();
-  gluOrtho2D(0, this->window.x, this->window.y, 0);
+  glOrtho(0, this->window.x, this->window.y, 0, -1, 1);
 
   glMatrixMode(GL_MODELVIEW);
   glLoadIdentity();
@@ -466,7 +469,7 @@ void opengl_on_alert(void * opaque, const LG_MsgAlert alert, const char * messag
 
   if (!(a->text = this->font->render(this->alertFontObj, 0xffffff00, message)))
   {
-    DEBUG_ERROR("Failed to render alert text: %s", TTF_GetError());
+    DEBUG_ERROR("Failed to render alert text");
     free(a);
     return;
   }
@@ -478,6 +481,17 @@ void opengl_on_alert(void * opaque, const LG_MsgAlert alert, const char * messag
   }
 
   ll_push(this->alerts, a);
+}
+
+void opengl_on_help(void * opaque, const char * message)
+{
+  // TODO: Implement this.
+}
+
+void opengl_on_show_fps(void * opaque, bool showFPS)
+{
+  struct Inst * this = (struct Inst *)opaque;
+  this->showFPS = showFPS;
 }
 
 void bitmap_to_texture(LG_FontBitmap * bitmap, GLuint texture)
@@ -505,16 +519,15 @@ void bitmap_to_texture(LG_FontBitmap * bitmap, GLuint texture)
   glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-bool opengl_render_startup(void * opaque, SDL_Window * window)
+bool opengl_render_startup(void * opaque)
 {
   struct Inst * this = (struct Inst *)opaque;
 
-  this->glContext = SDL_GL_CreateContext(window);
+  this->glContext = app_glCreateContext();
   if (!this->glContext)
-  {
-    DEBUG_ERROR("Failed to create the OpenGL context");
     return false;
-  }
+
+  app_glMakeCurrent(this->glContext);
 
   DEBUG_INFO("Vendor  : %s", glGetString(GL_VENDOR  ));
   DEBUG_INFO("Renderer: %s", glGetString(GL_RENDERER));
@@ -559,18 +572,18 @@ bool opengl_render_startup(void * opaque, SDL_Window * window)
   }
   this->hasTextures = true;
 
-  SDL_GL_SetSwapInterval(this->opt.vsync ? 1 : 0);
+  app_glSetSwapInterval(this->opt.vsync ? 1 : 0);
   this->renderStarted = true;
   return true;
 }
 
-bool opengl_render(void * opaque, SDL_Window * window, LG_RendererRotate rotate)
+bool opengl_render(void * opaque, LG_RendererRotate rotate)
 {
   struct Inst * this = (struct Inst *)opaque;
   if (!this)
     return false;
 
-  switch(configure(this, window))
+  switch(configure(this))
   {
     case CONFIG_STATUS_ERROR:
       DEBUG_ERROR("configure failed");
@@ -598,7 +611,7 @@ bool opengl_render(void * opaque, SDL_Window * window, LG_RendererRotate rotate)
       render_wait(this);
   }
 
-  if (this->fpsTexture)
+  if (this->showFPS && this->fpsTexture)
     glCallList(this->fpsList);
 
   struct Alert * alert;
@@ -663,6 +676,7 @@ bool opengl_render(void * opaque, SDL_Window * window, LG_RendererRotate rotate)
     glPushMatrix();
       glLoadIdentity();
       glTranslatef(this->window.x / 2, this->window.y / 2, 0.0f);
+      glScalef(this->uiScale, this->uiScale, 1.0f);
       glCallList(this->alertList);
     glPopMatrix();
     break;
@@ -670,11 +684,11 @@ bool opengl_render(void * opaque, SDL_Window * window, LG_RendererRotate rotate)
 
   if (this->opt.preventBuffer)
   {
-    SDL_GL_SwapWindow(window);
+    app_glSwapBuffers();
     glFinish();
   }
   else
-    SDL_GL_SwapWindow(window);
+    app_glSwapBuffers();
 
   this->mouseUpdate = false;
   return true;
@@ -683,7 +697,7 @@ bool opengl_render(void * opaque, SDL_Window * window, LG_RendererRotate rotate)
 void opengl_update_fps(void * opaque, const float avgUPS, const float avgFPS)
 {
   struct Inst * this = (struct Inst *)opaque;
-  if (!this->params.showFPS)
+  if (!this->showFPS)
     return;
 
   char str[128];
@@ -705,9 +719,6 @@ void opengl_update_fps(void * opaque, const float avgUPS, const float avgFPS)
   this->fpsTexture  = true;
 
   glNewList(this->fpsList, GL_COMPILE);
-    glPushMatrix();
-    glLoadIdentity();
-
     glEnable(GL_BLEND);
     glDisable(GL_TEXTURE_2D);
     glColor4f(0.0f, 0.0f, 1.0f, 0.5f);
@@ -729,8 +740,6 @@ void opengl_update_fps(void * opaque, const float avgUPS, const float avgFPS)
     glEnd();
     glBindTexture(GL_TEXTURE_2D, 0);
     glDisable(GL_BLEND);
-
-    glPopMatrix();
   glEndList();
 }
 
@@ -843,6 +852,8 @@ const LG_Renderer LGR_OpenGL =
   .on_frame_format = opengl_on_frame_format,
   .on_frame        = opengl_on_frame,
   .on_alert        = opengl_on_alert,
+  .on_help         = opengl_on_help,
+  .on_show_fps     = opengl_on_show_fps,
   .render_startup  = opengl_render_startup,
   .render          = opengl_render,
   .update_fps      = opengl_update_fps
@@ -854,12 +865,45 @@ static bool _check_gl_error(unsigned int line, const char * name)
   if (error == GL_NO_ERROR)
     return false;
 
-  const GLubyte * errStr = gluErrorString(error);
+  const char * errStr;
+  switch (error)
+  {
+    case GL_INVALID_ENUM:
+      errStr = "GL_INVALID_ENUM";
+      break;
+
+    case GL_INVALID_VALUE:
+      errStr = "GL_INVALID_VALUE";
+      break;
+
+    case GL_INVALID_OPERATION:
+      errStr = "GL_INVALID_OPERATION";
+      break;
+
+    case GL_STACK_OVERFLOW:
+      errStr = "GL_STACK_OVERFLOW";
+      break;
+
+    case GL_STACK_UNDERFLOW:
+      errStr = "GL_STACK_UNDERFLOW";
+      break;
+
+    case GL_OUT_OF_MEMORY:
+      errStr = "GL_OUT_OF_MEMORY";
+      break;
+
+    case GL_TABLE_TOO_LARGE:
+      errStr = "GL_TABLE_TOO_LARGE";
+      break;
+
+    default:
+      errStr = "unknown error";
+  }
   DEBUG_ERROR("%d: %s = %d (%s)", line, name, error, errStr);
   return true;
 }
 
-static enum ConfigStatus configure(struct Inst * this, SDL_Window *window)
+static enum ConfigStatus configure(struct Inst * this)
 {
   LG_LOCK(this->formatLock);
   if (!this->reconfigure)
@@ -1282,7 +1326,7 @@ static bool draw_frame(struct Inst * this)
         break;
 
       case GL_WAIT_FAILED:
-        DEBUG_ERROR("Wait failed %s", gluErrorString(glGetError()));
+        DEBUG_ERROR("Wait failed %d", glGetError());
         break;
     }
 

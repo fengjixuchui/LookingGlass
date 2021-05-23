@@ -1,6 +1,6 @@
 /*
 Looking Glass - KVM FrameRelay (KVMFR) Client
-Copyright (C) 2017-2019 Geoffrey McRae <geoff@hostfission.com>
+Copyright (C) 2017-2021 Geoffrey McRae <geoff@hostfission.com>
 https://looking-glass.hostfission.com
 
 This program is free software; you can redistribute it and/or modify it under
@@ -17,17 +17,15 @@ this program; if not, write to the Free Software Foundation, Inc., 59 Temple
 Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
-#pragma once
-#include "interface/decoder.h"
+#include "atoms.h"
+#include "x11.h"
 
-extern const LG_Decoder LGD_NULL;
-extern const LG_Decoder LGD_YUV420;
+struct X11DSAtoms x11atoms = { 0 };
 
-const LG_Decoder * LG_Decoders[] =
+void X11AtomsInit(void)
 {
-  &LGD_NULL,
-  &LGD_YUV420,
-  NULL // end of array sentinal
-};
-
-#define LG_DECODER_COUNT ((sizeof(LG_Decoders) / sizeof(LG_Decoder *)) - 1)
+  #define DEF_ATOM(x, onlyIfExists) \
+    x11atoms.x = XInternAtom(x11.display, #x, onlyIfExists);
+  DEF_ATOMS()
+  #undef DEF_ATOM
+}

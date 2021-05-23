@@ -36,15 +36,9 @@ Should this all go well you should be left with the file `looking-glass-client`
 ### Removing Wayland or X11 support
 
 Wayland and/or X11 support can be disabled with the compile options
-`ENABLE_WAYLAND` and `ENABLE_X11`, if both are specified only `SDL2` will remain
-and the client will fallback to using it.
+`ENABLE_WAYLAND=NO` and `ENABLE_X11=NO`. It is an error to disable both backends.
 
     cmake ../ -DENABLE_WAYLAND=OFF
-
-At this time, X11 is the perferred and best supported interface. Wayland is not
-far behind, however it lacks some of the seamless interaction features that X11
-has due to the lack of cursor warp (programmatic movement of the local cusror) on
-Wayland.
 
 ---
 
@@ -132,6 +126,7 @@ Command line arguments will override any options loaded from the config files.
 | win:keepAspect          | -r    | yes                    | Maintain the correct aspect ratio                                    |
 | win:forceAspect         |       | yes                    | Force the window to maintain the aspect ratio                        |
 | win:dontUpscale         |       | no                     | Never try to upscale the window                                      |
+| win:shrinkOnUpscale     |       | no                     | Limit the window dimensions when dontUpscale is enabled              |
 | win:borderless          | -d    | no                     | Borderless mode                                                      |
 | win:fullScreen          | -F    | no                     | Launch in fullscreen borderless mode                                 |
 | win:maximize            | -T    | no                     | Launch window maximized                                              |
@@ -145,21 +140,22 @@ Command line arguments will override any options loaded from the config files.
 | win:rotate              |       | 0                      | Rotate the displayed image (0, 90, 180, 270)                         |
 |---------------------------------------------------------------------------------------------------------------------------------|
 
-|----------------------------------------------------------------------------------------------------------------------------------------------|
-| Long                      | Short | Value           | Description                                                                            |
-|----------------------------------------------------------------------------------------------------------------------------------------------|
-| input:grabKeyboard        | -G    | yes             | Grab the keyboard in capture mode                                                      |
-| input:grabKeyboardOnFocus |       | yes             | Grab the keyboard when focused                                                         |
-| input:escapeKey           | -m    | 71 = ScrollLock | Specify the escape key, see https://wiki.libsdl.org/SDLScancodeLookup for valid values |
-| input:ignoreWindowsKeys   |       | no              | Do not pass events for the windows keys to the guest                                   |
-| input:hideCursor          | -M    | yes             | Hide the local mouse cursor                                                            |
-| input:mouseSens           |       | 0               | Initial mouse sensitivity when in capture mode (-9 to 9)                               |
-| input:mouseSmoothing      |       | yes             | Apply simple mouse smoothing when rawMouse is not in use (helps reduce aliasing)       |
-| input:rawMouse            |       | no              | Use RAW mouse input when in capture mode (good for gaming)                             |
-| input:mouseRedraw         |       | yes             | Mouse movements trigger redraws (ignores FPS minimum)                                  |
-| input:autoCapture         |       | no              | Try to keep the mouse captured when needed                                             |
-| input:captureOnly         |       | no              | Only enable input via SPICE if in capture mode                                         |
-|----------------------------------------------------------------------------------------------------------------------------------------------|
+|-----------------------------------------------------------------------------------------------------------------------------------------------|
+| Long                         | Short | Value               | Description                                                                      |
+|-----------------------------------------------------------------------------------------------------------------------------------------------|
+| input:grabKeyboard           | -G    | no                  | Grab the keyboard in capture mode                                                |
+| input:grabKeyboardOnFocus    |       | no                  | Grab the keyboard when focused                                                   |
+| input:releaseKeysOnFocusLoss |       | yes                 | On focus loss, send key up events to guest for all held keys                     |
+| input:escapeKey              | -m    | 70 = KEY_SCROLLLOCK | Specify the escape key, see <linux/input-event-codes.h> for valid values         |
+| input:ignoreWindowsKeys      |       | no                  | Do not pass events for the windows keys to the guest                             |
+| input:hideCursor             | -M    | yes                 | Hide the local mouse cursor                                                      |
+| input:mouseSens              |       | 0                   | Initial mouse sensitivity when in capture mode (-9 to 9)                         |
+| input:mouseSmoothing         |       | yes                 | Apply simple mouse smoothing when rawMouse is not in use (helps reduce aliasing) |
+| input:rawMouse               |       | no                  | Use RAW mouse input when in capture mode (good for gaming)                       |
+| input:mouseRedraw            |       | yes                 | Mouse movements trigger redraws (ignores FPS minimum)                            |
+| input:autoCapture            |       | no                  | Try to keep the mouse captured when needed                                       |
+| input:captureOnly            |       | no                  | Only enable input via SPICE if in capture mode                                   |
+|-----------------------------------------------------------------------------------------------------------------------------------------------|
 
 |------------------------------------------------------------------------------------------------------------------|
 | Long                   | Short | Value     | Description                                                         |
@@ -195,4 +191,10 @@ Command line arguments will override any options loaded from the config files.
 | opengl:preventBuffer |       | yes   | Prevent the driver from buffering frames    |
 | opengl:amdPinnedMem  |       | yes   | Use GL_AMD_pinned_memory if it is available |
 |------------------------------------------------------------------------------------|
+
+|-------------------------------------------------------------|
+| Long                | Short | Value | Description           |
+|-------------------------------------------------------------|
+| wayland:warpSupport |       | yes   | Enable cursor warping |
+|-------------------------------------------------------------|
 ```

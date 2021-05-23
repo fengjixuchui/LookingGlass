@@ -1,6 +1,6 @@
 /*
 Looking Glass - KVM FrameRelay (KVMFR) Client
-Copyright (C) 2017-2021 Geoffrey McRae <geoff@hostfission.com>
+Copyright (C) 2021 Guanzhong Chen <quantum2048@gmail.com>
 https://looking-glass.hostfission.com
 
 This program is free software; you can redistribute it and/or modify it under
@@ -17,16 +17,19 @@ this program; if not, write to the Free Software Foundation, Inc., 59 Temple
 Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
-#include "dynprocs.h"
+#ifndef _H_LG_COMMON_COUNTEDBUFFER_
+#define _H_LG_COMMON_COUNTEDBUFFER_
 
-struct EGLDynProcs g_dynprocs = {0};
+#include <stddef.h>
 
-void egl_dynProcsInit(void)
-{
-  g_dynprocs.eglGetPlatformDisplay = (eglGetPlatformDisplayEXT_t)
-    eglGetProcAddress("eglGetPlatformDisplay");
-  g_dynprocs.eglGetPlatformDisplayEXT = (eglGetPlatformDisplayEXT_t)
-    eglGetProcAddress("eglGetPlatformDisplayEXT");
-  g_dynprocs.glEGLImageTargetTexture2DOES = (glEGLImageTargetTexture2DOES_t)
-    eglGetProcAddress("glEGLImageTargetTexture2DOES");
+struct CountedBuffer {
+  _Atomic(size_t) refs;
+  size_t size;
+  char data[];
 };
+
+struct CountedBuffer * countedBufferNew(size_t size);
+void countedBufferAddRef(struct CountedBuffer * buffer);
+void countedBufferRelease(struct CountedBuffer ** buffer);
+
+#endif

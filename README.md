@@ -51,11 +51,12 @@ https://looking-glass.io/downloads
 
 ## Web
 
-https://forum.level1techs.com/t/looking-glass-triage/130952
+https://forum.level1techs.com/c/software/lookingglass/142
 
 ## Discord
 
-https://discord.gg/4ahCn4c
+* Looking Glass: https://discord.gg/52SMupxkvt
+* VFIO: https://discord.gg/4ahCn4c
 
 ## IRC
 

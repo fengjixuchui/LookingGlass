@@ -97,6 +97,31 @@ struct app
 
 static struct app app;
 
+static bool validateCaptureBackend(struct Option * opt, const char ** error)
+{
+  if (!*opt->value.x_string)
+    return true;
+
+  for (int i = 0; CaptureInterfaces[i]; ++i)
+    if (!strcasecmp(opt->value.x_string, CaptureInterfaces[i]->shortName))
+      return true;
+
+  return false;
+}
+
+static struct Option options[] =
+{
+  {
+    .module         = "app",
+    .name           = "capture",
+    .description    = "Select the capture backend",
+    .type           = OPTION_TYPE_STRING,
+    .value.x_string = "",
+    .validator      = validateCaptureBackend,
+  },
+  {0}
+};
+
 static bool lgmpTimer(void * opaque)
 {
   LGMP_STATUS status;
@@ -206,6 +231,7 @@ static int frameThread(void * opaque)
     fi->pitch             = frame.pitch;
     fi->offset            = pageSize - FrameBufferStructSize;
     fi->mouseScalePercent = app.iface->getMouseScale();
+    fi->blockScreensaver  = os_blockScreensaver();
     frameValid            = true;
 
     // put the framebuffer on the border of the next page
@@ -406,13 +432,15 @@ int app_main(int argc, char * argv[])
     if (CaptureInterfaces[i]->initOptions)
       CaptureInterfaces[i]->initOptions();
 
+  option_register(options);
+
   // try load values from a config file
   const char * dataPath = os_getDataPath();
   if (!dataPath)
   {
     option_free();
     DEBUG_ERROR("Failed to get the application's data path");
-    return LG_HOST_EXIT_FAILED;
+    return LG_HOST_EXIT_FATAL;
   }
 
   const size_t len = strlen(dataPath) + sizeof(CONFIG_FILE) + 1;
@@ -429,18 +457,18 @@ int app_main(int argc, char * argv[])
   {
     option_free();
     DEBUG_ERROR("Failure to parse the command line");
-    return LG_HOST_EXIT_FAILED;
+    return LG_HOST_EXIT_FATAL;
   }
 
   if (!option_validate())
   {
     option_free();
-    return LG_HOST_EXIT_FAILED;
+    return LG_HOST_EXIT_FATAL;
   }
 
   // perform platform specific initialization
   if (!app_init())
-    return LG_HOST_EXIT_FAILED;
+    return LG_HOST_EXIT_FATAL;
 
   DEBUG_INFO("Looking Glass Host (%s)", BUILD_VERSION);
 
@@ -448,13 +476,13 @@ int app_main(int argc, char * argv[])
   if (!ivshmemInit(&shmDev))
   {
     DEBUG_ERROR("Failed to find the IVSHMEM device");
-    return LG_HOST_EXIT_FAILED;
+    return LG_HOST_EXIT_FATAL;
   }
 
   if (!ivshmemOpen(&shmDev))
   {
     DEBUG_ERROR("Failed to open the IVSHMEM device");
-    return LG_HOST_EXIT_FAILED;
+    return LG_HOST_EXIT_FATAL;
   }
 
   int exitcode  = 0;
@@ -474,21 +502,21 @@ int app_main(int argc, char * argv[])
           sizeof(udata), (uint8_t *)&udata)) != LGMP_OK)
   {
     DEBUG_ERROR("lgmpHostInit Failed: %s", lgmpStatusString(status));
-    exitcode = LG_HOST_EXIT_FAILED;
+    exitcode = LG_HOST_EXIT_FATAL;
     goto fail_ivshmem;
   }
 
   if ((status = lgmpHostQueueNew(app.lgmp, FRAME_QUEUE_CONFIG, &app.frameQueue)) != LGMP_OK)
   {
     DEBUG_ERROR("lgmpHostQueueCreate Failed (Frame): %s", lgmpStatusString(status));
-    exitcode = LG_HOST_EXIT_FAILED;
+    exitcode = LG_HOST_EXIT_FATAL;
     goto fail_lgmp;
   }
 
   if ((status = lgmpHostQueueNew(app.lgmp, POINTER_QUEUE_CONFIG, &app.pointerQueue)) != LGMP_OK)
   {
     DEBUG_ERROR("lgmpHostQueueNew Failed (Pointer): %s", lgmpStatusString(status));
-    exitcode = LG_HOST_EXIT_FAILED;
+    exitcode = LG_HOST_EXIT_FATAL;
     goto fail_lgmp;
   }
 
@@ -497,7 +525,7 @@ int app_main(int argc, char * argv[])
     if ((status = lgmpHostMemAlloc(app.lgmp, MAX_POINTER_SIZE, &app.pointerMemory[i])) != LGMP_OK)
     {
       DEBUG_ERROR("lgmpHostMemAlloc Failed (Pointer): %s", lgmpStatusString(status));
-      exitcode = LG_HOST_EXIT_FAILED;
+      exitcode = LG_HOST_EXIT_FATAL;
       goto fail_lgmp;
     }
     memset(lgmpHostMemPtr(app.pointerMemory[i]), 0, MAX_POINTER_SIZE);
@@ -507,7 +535,7 @@ int app_main(int argc, char * argv[])
   if ((status = lgmpHostMemAlloc(app.lgmp, MAX_POINTER_SIZE, &app.pointerShape)) != LGMP_OK)
   {
     DEBUG_ERROR("lgmpHostMemAlloc Failed (Pointer Shape): %s", lgmpStatusString(status));
-    exitcode = LG_HOST_EXIT_FAILED;
+    exitcode = LG_HOST_EXIT_FATAL;
     goto fail_lgmp;
   }
 
@@ -522,15 +550,19 @@ int app_main(int argc, char * argv[])
     if ((status = lgmpHostMemAllocAligned(app.lgmp, app.maxFrameSize, sz, &app.frameMemory[i])) != LGMP_OK)
     {
       DEBUG_ERROR("lgmpHostMemAlloc Failed (Frame): %s", lgmpStatusString(status));
-      exitcode = LG_HOST_EXIT_FAILED;
+      exitcode = LG_HOST_EXIT_FATAL;
       goto fail_lgmp;
     }
   }
 
+  const char * ifaceName = option_get_string("app", "capture");
   CaptureInterface * iface = NULL;
   for(int i = 0; CaptureInterfaces[i]; ++i)
   {
     iface = CaptureInterfaces[i];
+    if (*ifaceName && strcasecmp(ifaceName, iface->shortName))
+      continue;
+
     DEBUG_INFO("Trying           : %s", iface->getName());
 
     if (!iface->create(captureGetPointerBuffer, capturePostPointerBuffer))
@@ -548,7 +580,10 @@ int app_main(int argc, char * argv[])
 
   if (!iface)
   {
-    DEBUG_ERROR("Failed to find a supported capture interface");
+    if (*ifaceName)
+      DEBUG_ERROR("Specified capture interface not supported");
+    else
+      DEBUG_ERROR("Failed to find a supported capture interface");
     exitcode = LG_HOST_EXIT_FAILED;
     goto fail_lgmp;
   }
@@ -565,8 +600,6 @@ int app_main(int argc, char * argv[])
     DEBUG_ERROR("Failed to create the LGMP timer");
 
     iface->deinit();
-    iface->free();
-
     goto fail_timer;
   }
 
@@ -684,6 +717,7 @@ fail_capture:
   lgTimerDestroy(app.lgmpTimer);
 
 fail_timer:
+  iface->free();
   LG_LOCK_FREE(app.pointerLock);
 
 fail_lgmp:

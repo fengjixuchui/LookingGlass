@@ -17,11 +17,17 @@ this program; if not, write to the Free Software Foundation, Inc., 59 Temple
 Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
-#include <SDL2/SDL_egl.h>
+#ifndef _H_LG_EGL_DYNPROCS_
+#define _H_LG_EGL_DYNPROCS_
+#ifdef ENABLE_EGL
+
+#include <EGL/egl.h>
 #include <GL/gl.h>
 
 typedef EGLDisplay (*eglGetPlatformDisplayEXT_t)(EGLenum platform,
     void *native_display, const EGLint *attrib_list);
+typedef void (*eglSwapBuffersWithDamageKHR_t)(EGLDisplay dpy,
+    EGLSurface surface, const EGLint *rects, EGLint n_rects);
 typedef void (*glEGLImageTargetTexture2DOES_t)(GLenum target,
     GLeglImageOES image);
 
@@ -29,9 +35,17 @@ struct EGLDynProcs
 {
   eglGetPlatformDisplayEXT_t     eglGetPlatformDisplay;
   eglGetPlatformDisplayEXT_t     eglGetPlatformDisplayEXT;
+  eglSwapBuffersWithDamageKHR_t  eglSwapBuffersWithDamageKHR;
+  eglSwapBuffersWithDamageKHR_t  eglSwapBuffersWithDamageEXT;
   glEGLImageTargetTexture2DOES_t glEGLImageTargetTexture2DOES;
 };
 
-extern struct EGLDynProcs g_dynprocs;
+extern struct EGLDynProcs g_egl_dynProcs;
 
 void egl_dynProcsInit(void);
+
+#else
+  #define egl_dynProcsInit(...)
+#endif
+
+#endif // _H_LG_EGL_DYNPROCS_

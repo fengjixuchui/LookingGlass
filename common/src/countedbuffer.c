@@ -1,6 +1,6 @@
 /*
 Looking Glass - KVM FrameRelay (KVMFR) Client
-Copyright (C) 2017-2019 Geoffrey McRae <geoff@hostfission.com>
+Copyright (C) 2021 Guanzhong Chen <quantum2048@gmail.com>
 https://looking-glass.hostfission.com
 
 This program is free software; you can redistribute it and/or modify it under
@@ -17,11 +17,31 @@ this program; if not, write to the Free Software Foundation, Inc., 59 Temple
 Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
-#pragma once
-
+#include "common/countedbuffer.h"
 #include <stdlib.h>
-#include <stdbool.h>
+#include <stdatomic.h>
 
-// reads the specified file into a new buffer
-// the callee must free the buffer
-bool file_get_contents(const char * filename, char ** buffer, size_t * length);
+struct CountedBuffer * countedBufferNew(size_t size)
+{
+  struct CountedBuffer * buffer = malloc(sizeof(struct CountedBuffer) + size);
+  if (!buffer)
+    return NULL;
+
+  atomic_init(&buffer->refs, 1);
+  buffer->size = size;
+  return buffer;
+}
+
+void countedBufferAddRef(struct CountedBuffer * buffer)
+{
+  atomic_fetch_add(&buffer->refs, 1);
+}
+
+void countedBufferRelease(struct CountedBuffer ** buffer)
+{
+  if (atomic_fetch_sub(&(*buffer)->refs, 1) == 1)
+  {
+    free(*buffer);
+    *buffer = NULL;
+  }
+}

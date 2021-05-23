@@ -61,11 +61,15 @@ struct iface
 
   int mouseX, mouseY, mouseHotX, mouseHotY;
   bool mouseVisible, hasMousePosition;
+
+  bool mouseHookCreated;
+  bool forceCompositionCreated;
 };
 
 static struct iface * this = NULL;
 
-static void nvfbc_free();
+static bool nvfbc_deinit(void);
+static void nvfbc_free(void);
 static int pointerThread(void * unused);
 
 static void getDesktopSize(unsigned int * width, unsigned int * height, unsigned int * dpi)
@@ -87,7 +91,8 @@ static void on_mouseMove(int x, int y)
   this->hasMousePosition = true;
   this->mouseX           = x;
   this->mouseY           = y;
-  lgSignalEvent(this->cursorEvents[0]);
+  if (this->cursorEvents[0])
+    lgSignalEvent(this->cursorEvents[0]);
 }
 
 static const char * nvfbc_getName(void)
@@ -119,36 +124,7 @@ static bool nvfbc_create(
   if (!NvFBCInit())
     return false;
 
-  int       bufferLen   = GetEnvironmentVariable("NVFBC_PRIV_DATA", NULL, 0);
-  uint8_t * privData    = NULL;
-  int       privDataLen = 0;
-
-  if(bufferLen)
-  {
-    char * buffer = malloc(bufferLen);
-    GetEnvironmentVariable("NVFBC_PRIV_DATA", buffer, bufferLen);
-
-    privDataLen = (bufferLen - 1) / 2;
-    privData    = (uint8_t *)malloc(privDataLen);
-    char hex[3] = {0};
-    for(int i = 0; i < privDataLen; ++i)
-    {
-      memcpy(hex, &buffer[i*2], 2);
-      privData[i] = (uint8_t)strtoul(hex, NULL, 16);
-    }
-
-    free(buffer);
-  }
-
   this = (struct iface *)calloc(sizeof(struct iface), 1);
-  if (!NvFBCToSysCreate(privData, privDataLen, &this->nvfbc, &this->maxWidth, &this->maxHeight))
-  {
-    free(privData);
-    nvfbc_free();
-    return false;
-  }
-  free(privData);
-
   this->frameEvent = lgCreateEvent(true, 17);
   if (!this->frameEvent)
   {
@@ -167,6 +143,35 @@ static bool nvfbc_create(
 static bool nvfbc_init(void)
 {
   this->stop = false;
+
+  int       bufferLen   = GetEnvironmentVariable("NVFBC_PRIV_DATA", NULL, 0);
+  uint8_t * privData    = NULL;
+  int       privDataLen = 0;
+
+  if (bufferLen)
+  {
+    char * buffer = malloc(bufferLen);
+    GetEnvironmentVariable("NVFBC_PRIV_DATA", buffer, bufferLen);
+
+    privDataLen = (bufferLen - 1) / 2;
+    privData    = (uint8_t *)malloc(privDataLen);
+    char hex[3] = {0};
+    for(int i = 0; i < privDataLen; ++i)
+    {
+      memcpy(hex, &buffer[i*2], 2);
+      privData[i] = (uint8_t)strtoul(hex, NULL, 16);
+    }
+
+    free(buffer);
+  }
+
+  if (!NvFBCToSysCreate(privData, privDataLen, &this->nvfbc, &this->maxWidth, &this->maxHeight))
+  {
+    free(privData);
+    return false;
+  }
+  free(privData);
+
   getDesktopSize(&this->width, &this->height, &this->dpi);
   lgResetEvent(this->frameEvent);
 
@@ -187,12 +192,21 @@ static bool nvfbc_init(void)
   }
 
   this->cursorEvents[0] = lgCreateEvent(true, 10);
-  mouseHook_install(on_mouseMove);
 
   if (this->seperateCursor)
     this->cursorEvents[1] = lgWrapEvent(event);
 
-  dwmForceComposition();
+  if (!this->mouseHookCreated)
+  {
+    mouseHook_install(on_mouseMove);
+    this->mouseHookCreated = true;
+  }
+
+  if (!this->forceCompositionCreated)
+  {
+    dwmForceComposition();
+    this->forceCompositionCreated = true;
+  }
 
   DEBUG_INFO("Cursor mode      : %s", this->seperateCursor ? "decoupled" : "integrated");
 
@@ -201,6 +215,7 @@ static bool nvfbc_init(void)
   if (!lgCreateThread("NvFBCPointer", pointerThread, NULL, &this->pointerThread))
   {
     DEBUG_ERROR("Failed to create the NvFBCPointer thread");
+    nvfbc_deinit();
     return false;
   }
 
@@ -224,13 +239,16 @@ static void nvfbc_stop(void)
 
 static bool nvfbc_deinit(void)
 {
-  mouseHook_remove();
-  dwmUnforceComposition();
-
   if (this->cursorEvents[0])
   {
     lgFreeEvent(this->cursorEvents[0]);
     this->cursorEvents[0] = NULL;
+  }
+
+  if (this->nvfbc)
+  {
+    NvFBCToSysRelease(&this->nvfbc);
+    this->nvfbc = NULL;
   }
 
   return true;
@@ -238,10 +256,14 @@ static bool nvfbc_deinit(void)
 
 static void nvfbc_free(void)
 {
-  NvFBCToSysRelease(&this->nvfbc);
-
   if (this->frameEvent)
     lgFreeEvent(this->frameEvent);
+
+  if (this->mouseHookCreated)
+    mouseHook_remove();
+
+  if (this->forceCompositionCreated)
+    dwmUnforceComposition();
 
   free(this);
   this = NULL;
@@ -406,6 +428,7 @@ static int pointerThread(void * unused)
 
 struct CaptureInterface Capture_NVFBC =
 {
+  .shortName       = "NvFBC",
   .getName         = nvfbc_getName,
   .initOptions     = nvfbc_initOptions,
 

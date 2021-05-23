@@ -17,13 +17,24 @@ this program; if not, write to the Free Software Foundation, Inc., 59 Temple
 Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
+#ifndef _H_LG_COMMON_DEBUG_
+#define _H_LG_COMMON_DEBUG_
+
 #ifndef __STDC_FORMAT_MACROS
 #define __STDC_FORMAT_MACROS
 #endif
 
+#include <stdlib.h>
 #include <stdio.h>
 #include <inttypes.h>
 #include "time.h"
+
+#ifdef ENABLE_BACKTRACE
+void printBacktrace(void);
+#define DEBUG_PRINT_BACKTRACE() printBacktrace()
+#else
+#define DEBUG_PRINT_BACKTRACE()
+#endif
 
 #if defined(_WIN32) && !defined(__GNUC__)
   #define DIRECTORY_SEPARATOR '\\'
@@ -53,16 +64,27 @@ Place, Suite 330, Boston, MA 02111-1307 USA
   sizeof(s) > 20 && (s)[sizeof(s)-21] == DIRECTORY_SEPARATOR ? (s) + sizeof(s) - 20 : \
   sizeof(s) > 21 && (s)[sizeof(s)-22] == DIRECTORY_SEPARATOR ? (s) + sizeof(s) - 21 : (s))
 
-#define DEBUG_PRINT(type, fmt, ...) do {fprintf(stderr, "%12" PRId64 " " type " %20s:%-4u | %-30s | " fmt "\n", microtime(), STRIPPATH(__FILE__), __LINE__, __FUNCTION__, ##__VA_ARGS__);} while (0)
+#define DEBUG_PRINT(type, fmt, ...) do { \
+  fprintf(stderr, "%12" PRId64 " " type " %20s:%-4u | %-30s | " fmt "\n", \
+      microtime(), STRIPPATH(__FILE__), __LINE__, __FUNCTION__, ##__VA_ARGS__);\
+} while (0)
 
-#define DEBUG_BREAK() DEBUG_PRINT("[ ]", "%s", "================================================================================")
+#define DEBUG_BREAK() DEBUG_PRINT("[ ]", "================================================================================")
 #define DEBUG_INFO(fmt, ...) DEBUG_PRINT("[I]", fmt, ##__VA_ARGS__)
 #define DEBUG_WARN(fmt, ...) DEBUG_PRINT("[W]", fmt, ##__VA_ARGS__)
 #define DEBUG_ERROR(fmt, ...) DEBUG_PRINT("[E]", fmt, ##__VA_ARGS__)
 #define DEBUG_FIXME(fmt, ...) DEBUG_PRINT("[F]", fmt, ##__VA_ARGS__)
+#define DEBUG_FATAL(fmt, ...) do { \
+  DEBUG_BREAK(); \
+  DEBUG_PRINT("[!]", fmt, ##__VA_ARGS__); \
+  DEBUG_PRINT_BACKTRACE(); \
+  abort(); \
+} while(0)
 
 #if defined(DEBUG_SPICE) | defined(DEBUG_IVSHMEM)
   #define DEBUG_PROTO(fmt, args...) DEBUG_PRINT("[P]", fmt, ##args)
 #else
   #define DEBUG_PROTO(fmt, ...) do {} while(0)
+#endif
+
 #endif
